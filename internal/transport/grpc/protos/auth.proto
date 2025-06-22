@@ -1,0 +1,98 @@
+syntax = "proto3";
+
+package auth;
+
+option go_package = "./protos";
+
+// Auth Service definition
+service AuthService {
+    rpc Register(RegisterRequest) returns (RegisterResponse);
+    rpc Login(LoginRequest) returns (LoginResponse);
+    rpc GetUserProfile(GetUserProfileRequest) returns (GetUserProfileResponse);
+    rpc UpdateUserProfile(UpdateUserProfileRequest) returns (UpdateUserProfileResponse);
+    rpc VerifyEmail(VerifyEmailRequest) returns (VerifyEmailResponse);
+    rpc Logout(LogoutRequest) returns (LogoutResponse);
+    rpc ValidateToken(ValidateTokenRequest) returns (ValidateTokenResponse);
+    rpc RefreshToken(RefreshTokenRequest) returns (RefreshTokenResponse);
+}
+
+// AuthUser model
+message AuthUser {
+    string id = 1;
+    string email = 2;
+    string username = 3;
+    bool is_active = 4;
+    bool is_email_verified = 5;
+    int64 storage_quota = 6;
+    int64 used_space = 7;
+    string role = 8;
+    bool is_admin = 9;
+    string created_at = 10;
+    string updated_at = 11;
+}
+
+// Request/Response messages
+message RegisterRequest {
+    string email = 1;
+    string username = 2;
+    string password = 3;
+}
+
+message RegisterResponse {
+    AuthUser user = 1;
+}
+
+message LoginRequest {
+    string email = 1;
+    string password = 2;
+}
+
+message LoginResponse {
+    AuthUser user = 1;
+    string token = 2;
+}
+
+message GetUserProfileRequest {
+    string user_id = 1;
+}
+
+message GetUserProfileResponse {
+    AuthUser user = 1;
+}
+
+message UpdateUserProfileRequest {
+    string user_id = 1;
+    string username = 2;
+    string old_password = 3;
+    string new_password = 4;
+}
+
+message UpdateUserProfileResponse {}
+
+message VerifyEmailRequest {
+    string token = 1;
+}
+
+message VerifyEmailResponse {}
+
+message LogoutRequest {
+    string token = 1;
+}
+
+message LogoutResponse {}
+
+message ValidateTokenRequest {
+    string token = 1;
+}
+
+message ValidateTokenResponse {
+    AuthUser user = 1;
+}
+
+message RefreshTokenRequest {
+    string token = 1;
+}
+
+message RefreshTokenResponse {
+    string token = 1;
+} 

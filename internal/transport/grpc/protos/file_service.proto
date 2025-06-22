@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package fileservice;
+
+option go_package = "./protos";
+
+// File Service definition
+service FileService {
+    // Создание директории для пользователя при регистрации
+    rpc CreateUserDirectory(CreateUserDirectoryRequest) returns (CreateUserDirectoryResponse);
+}
+
+// Запрос на создание директории пользователя
+message CreateUserDirectoryRequest {
+    string user_id = 1;        // UUID пользователя
+    string username = 2;       // Имя пользователя (опционально)
+}
+
+// Ответ на создание директории пользователя
+message CreateUserDirectoryResponse {
+    bool success = 1;          // Успешность операции
+    string message = 2;        // Сообщение о результате
+    string directory_path = 3; // Путь к созданной директории
+} 
