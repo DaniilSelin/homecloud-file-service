@@ -44,6 +44,20 @@ type FileRepository interface {
 	UpdateLastViewed(ctx context.Context, id uuid.UUID) error
 	SearchFiles(ctx context.Context, ownerID uuid.UUID, query string) ([]models.File, error)
 	GetFileTree(ctx context.Context, ownerID uuid.UUID, rootID *uuid.UUID) ([]models.File, error)
+
+	// Дополнительные операции с файлами
+	MoveFile(ctx context.Context, fileID uuid.UUID, newParentID *uuid.UUID) error
+	CopyFile(ctx context.Context, fileID uuid.UUID, newParentID *uuid.UUID, newName string) (*models.File, error)
+	StarFile(ctx context.Context, fileID uuid.UUID) error
+	UnstarFile(ctx context.Context, fileID uuid.UUID) error
+
+	// Операции с метаданными
+	UpdateFileMetadata(ctx context.Context, fileID uuid.UUID, metadata map[string]interface{}) error
+	GetFileMetadata(ctx context.Context, fileID uuid.UUID) (map[string]interface{}, error)
+
+	// Операции проверки целостности
+	VerifyFileIntegrity(ctx context.Context, fileID uuid.UUID) (bool, error)
+	CalculateFileChecksums(ctx context.Context, fileID uuid.UUID) (map[string]string, error)
 }
 
 // StorageRepository интерфейс для работы с файловым хранилищем

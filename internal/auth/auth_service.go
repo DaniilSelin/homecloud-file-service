@@ -9,6 +9,8 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"go.uber.org/zap"
+	"homecloud-file-service/internal/logger"
 )
 
 // AuthService представляет сервис аутентификации
@@ -36,6 +38,8 @@ func NewAuthService(host string, port int) (*AuthService, error) {
 
 // ValidateToken проверяет токен и возвращает информацию о пользователе
 func (a *AuthService) ValidateToken(ctx context.Context, token string) (*pb.AuthUser, error) {
+	lg := logger.GetLoggerFromCtx(ctx)
+	lg.Info(ctx, "ValidateToken called", zap.String("token", token))
 	// Убираем префикс "Bearer " если он есть
 	token = strings.TrimPrefix(token, "Bearer ")
 
@@ -45,6 +49,7 @@ func (a *AuthService) ValidateToken(ctx context.Context, token string) (*pb.Auth
 
 	resp, err := a.client.ValidateToken(ctx, req)
 	if err != nil {
+		lg.Error(ctx, "failed to validate token", zap.Error(err))
 		return nil, fmt.Errorf("failed to validate token: %w", err)
 	}
 

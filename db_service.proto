@@ -1,0 +1,315 @@
+syntax = "proto3";
+
+package dbservice;
+
+option go_package = "homecloud-auth-service/internal/transport/grpc/protos";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/empty.proto";
+
+// Service definition
+service DBService {
+    // User operations
+    rpc CreateUser(User) returns (UserID) {}
+    rpc GetUserByID(UserID) returns (User) {}
+    rpc GetUserByEmail(EmailRequest) returns (User) {}
+    rpc UpdateUser(User) returns (google.protobuf.Empty) {}
+    rpc UpdatePassword(UpdatePasswordRequest) returns (google.protobuf.Empty) {}
+    rpc UpdateUsername(UpdateUsernameRequest) returns (google.protobuf.Empty) {}
+    rpc UpdateEmailVerification(UpdateEmailVerificationRequest) returns (google.protobuf.Empty) {}
+    rpc UpdateLastLogin(UserID) returns (google.protobuf.Empty) {}
+    rpc UpdateFailedLoginAttempts(UpdateFailedLoginAttemptsRequest) returns (google.protobuf.Empty) {}
+    rpc UpdateLockedUntil(UpdateLockedUntilRequest) returns (google.protobuf.Empty) {}
+    rpc UpdateStorageUsage(UpdateStorageUsageRequest) returns (google.protobuf.Empty) {}
+    rpc CheckEmailExists(EmailRequest) returns (ExistsResponse) {}
+    rpc CheckUsernameExists(UsernameRequest) returns (ExistsResponse) {}
+
+    // File operations
+    rpc CreateFile(File) returns (FileID) {}
+    rpc GetFileByID(FileID) returns (File) {}
+    rpc GetFileByPath(GetFileByPathRequest) returns (File) {}
+    rpc UpdateFile(File) returns (google.protobuf.Empty) {}
+    rpc DeleteFile(FileID) returns (google.protobuf.Empty) {}
+    rpc SoftDeleteFile(FileID) returns (google.protobuf.Empty) {}
+    rpc RestoreFile(FileID) returns (google.protobuf.Empty) {}
+    rpc ListFiles(ListFilesRequest) returns (ListFilesResponse) {}
+    rpc ListFilesByParent(ListFilesByParentRequest) returns (ListFilesResponse) {}
+    rpc ListStarredFiles(ListStarredFilesRequest) returns (ListFilesResponse) {}
+    rpc ListTrashedFiles(ListTrashedFilesRequest) returns (ListFilesResponse) {}
+    rpc SearchFiles(SearchFilesRequest) returns (ListFilesResponse) {}
+    rpc GetFileSize(FileID) returns (FileSizeResponse) {}
+    rpc UpdateFileSize(UpdateFileSizeRequest) returns (google.protobuf.Empty) {}
+    rpc UpdateLastViewed(FileID) returns (google.protobuf.Empty) {}
+    rpc GetFileTree(GetFileTreeRequest) returns (ListFilesResponse) {}
+
+    // File revision operations
+    rpc CreateRevision(FileRevision) returns (RevisionID) {}
+    rpc GetRevisions(FileID) returns (ListRevisionsResponse) {}
+    rpc GetRevision(GetRevisionRequest) returns (FileRevision) {}
+    rpc DeleteRevision(RevisionID) returns (google.protobuf.Empty) {}
+
+    // File permission operations
+    rpc CreatePermission(FilePermission) returns (PermissionID) {}
+    rpc GetPermissions(FileID) returns (ListPermissionsResponse) {}
+    rpc UpdatePermission(FilePermission) returns (google.protobuf.Empty) {}
+    rpc DeletePermission(PermissionID) returns (google.protobuf.Empty) {}
+    rpc CheckPermission(CheckPermissionRequest) returns (PermissionResponse) {}
+
+    // File metadata operations
+    rpc UpdateFileMetadata(UpdateFileMetadataRequest) returns (google.protobuf.Empty) {}
+    rpc GetFileMetadata(FileID) returns (FileMetadataResponse) {}
+
+    // File operations (star, move, copy, rename)
+    rpc StarFile(FileID) returns (google.protobuf.Empty) {}
+    rpc UnstarFile(FileID) returns (google.protobuf.Empty) {}
+    rpc MoveFile(MoveFileRequest) returns (google.protobuf.Empty) {}
+    rpc CopyFile(CopyFileRequest) returns (File) {}
+    rpc RenameFile(RenameFileRequest) returns (google.protobuf.Empty) {}
+
+    // File integrity operations
+    rpc VerifyFileIntegrity(FileID) returns (IntegrityResponse) {}
+    rpc CalculateFileChecksums(FileID) returns (ChecksumsResponse) {}
+}
+
+// Message definitions for Users
+message User {
+    string id = 1;
+    string email = 2;
+    string username = 3;
+    string password_hash = 4;
+    bool is_active = 5;
+    bool is_email_verified = 6;
+    string role = 7;
+    int64 storage_quota = 8;
+    int64 used_space = 9;
+    google.protobuf.Timestamp created_at = 10;
+    google.protobuf.Timestamp updated_at = 11;
+    int32 failed_login_attempts = 12;
+    google.protobuf.Timestamp locked_until = 13;
+    google.protobuf.Timestamp last_login = 14;
+}
+
+message UserID {
+    string id = 1;
+}
+
+message EmailRequest {
+    string email = 1;
+}
+
+message UsernameRequest {
+    string username = 1;
+}
+
+message UpdatePasswordRequest {
+    string id = 1;
+    string password_hash = 2;
+}
+
+message UpdateUsernameRequest {
+    string id = 1;
+    string username = 2;
+}
+
+message UpdateEmailVerificationRequest {
+    string id = 1;
+    bool is_verified = 2;
+}
+
+message UpdateFailedLoginAttemptsRequest {
+    string id = 1;
+    int32 attempts = 2;
+}
+
+message UpdateLockedUntilRequest {
+    string id = 1;
+    google.protobuf.Timestamp locked_until = 2;
+}
+
+message UpdateStorageUsageRequest {
+    string id = 1;
+    int64 used_space = 2;
+}
+
+message ExistsResponse {
+    bool exists = 1;
+}
+
+// Message definitions for Files
+message File {
+    string id = 1;
+    string owner_id = 2;
+    string parent_id = 3;
+    string name = 4;
+    string file_extension = 5;
+    string mime_type = 6;
+    string storage_path = 7;
+    int64 size = 8;
+    string md5_checksum = 9;
+    string sha256_checksum = 10;
+    bool is_folder = 11;
+    bool is_trashed = 12;
+    google.protobuf.Timestamp trashed_at = 13;
+    bool starred = 14;
+    google.protobuf.Timestamp created_at = 15;
+    google.protobuf.Timestamp updated_at = 16;
+    google.protobuf.Timestamp last_viewed_at = 17;
+    bool viewed_by_me = 18;
+    int64 version = 19;
+    string revision_id = 20;
+    string indexable_text = 21;
+    string thumbnail_link = 22;
+    string web_view_link = 23;
+    string web_content_link = 24;
+    string icon_link = 25;
+}
+
+message FileID {
+    string id = 1;
+}
+
+message GetFileByPathRequest {
+    string owner_id = 1;
+    string path = 2;
+}
+
+message ListFilesRequest {
+    string parent_id = 1;
+    string owner_id = 2;
+    bool is_trashed = 3;
+    bool starred = 4;
+    int32 limit = 5;
+    int32 offset = 6;
+    string order_by = 7;
+    string order_dir = 8;
+}
+
+message ListFilesResponse {
+    repeated File files = 1;
+    int64 total = 2;
+    int32 limit = 3;
+    int32 offset = 4;
+}
+
+message ListFilesByParentRequest {
+    string owner_id = 1;
+    string parent_id = 2;
+}
+
+message ListStarredFilesRequest {
+    string owner_id = 1;
+}
+
+message ListTrashedFilesRequest {
+    string owner_id = 1;
+}
+
+message SearchFilesRequest {
+    string owner_id = 1;
+    string query = 2;
+}
+
+message FileSizeResponse {
+    int64 size = 1;
+}
+
+message UpdateFileSizeRequest {
+    string id = 1;
+    int64 size = 2;
+}
+
+message GetFileTreeRequest {
+    string owner_id = 1;
+    string root_id = 2;
+}
+
+// Message definitions for File Revisions
+message FileRevision {
+    string id = 1;
+    string file_id = 2;
+    int64 revision_id = 3;
+    string md5_checksum = 4;
+    int64 size = 5;
+    google.protobuf.Timestamp created_at = 6;
+    string storage_path = 7;
+    string mime_type = 8;
+    string user_id = 9;
+}
+
+message RevisionID {
+    string id = 1;
+}
+
+message ListRevisionsResponse {
+    repeated FileRevision revisions = 1;
+}
+
+message GetRevisionRequest {
+    string file_id = 1;
+    int64 revision_id = 2;
+}
+
+// Message definitions for File Permissions
+message FilePermission {
+    string id = 1;
+    string file_id = 2;
+    string grantee_id = 3;
+    string grantee_type = 4;
+    string role = 5;
+    bool allow_share = 6;
+    google.protobuf.Timestamp created_at = 7;
+}
+
+message PermissionID {
+    string id = 1;
+}
+
+message ListPermissionsResponse {
+    repeated FilePermission permissions = 1;
+}
+
+message CheckPermissionRequest {
+    string file_id = 1;
+    string user_id = 2;
+    string required_role = 3;
+}
+
+message PermissionResponse {
+    bool has_permission = 1;
+}
+
+// File metadata operations
+message UpdateFileMetadataRequest {
+    string file_id = 1;
+    string metadata = 2;
+}
+
+message FileMetadataResponse {
+    string metadata = 1;
+}
+
+// File operations (star, move, copy, rename)
+message MoveFileRequest {
+    string file_id = 1;
+    string new_parent_id = 2;
+}
+
+message CopyFileRequest {
+    string file_id = 1;
+    string new_parent_id = 2;
+    string new_name = 3;
+}
+
+message RenameFileRequest {
+    string file_id = 1;
+    string new_name = 2;
+}
+
+// File integrity operations
+message IntegrityResponse {
+    bool is_integrity_verified = 1;
+}
+
+message ChecksumsResponse {
+    map<string, string> checksums = 1;
+} 

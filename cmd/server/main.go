@@ -3,12 +3,11 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
+	"io"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
-	"syscall"
 	"time"
 
 	"homecloud-file-service/config"
@@ -25,44 +24,74 @@ import (
 )
 
 func main() {
-	// Загружаем конфигурацию
+	ctx := context.Background()
+	ctx, cancel := signal.NotifyContext(ctx, os.Interrupt)
+	defer cancel()
+
+	httpServer, logBase, grpcServer, err := run(ctx, os.Stdout, os.Args)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s\n", err)
+		os.Exit(1)
+	}
+
+	<-ctx.Done()
+	logBase.Info(ctx, "Shutdown signal received")
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer shutdownCancel()
+
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		logBase.Error(ctx, "HTTP server shutdown failed", zap.Error(err))
+	}
+
+	if grpcServer != nil {
+		grpcServer.GracefulStop()
+	}
+
+	logBase.Info(ctx, "Servers exited gracefully")
+}
+
+func run(ctx context.Context, w io.Writer, args []string) (*http.Server, *logger.Logger, *grpc.Server, error) {
 	cfg, err := config.LoadConfig("config/config.local.yaml")
 	if err != nil {
-		log.Fatalf("Failed to load config: %v", err)
+		return nil, nil, nil, err
 	}
-
-	// Инициализируем логгер
-	logger, err := logger.New(cfg)
+	logBase, err := logger.New(cfg)
 	if err != nil {
-		log.Fatalf("Failed to create logger: %v", err)
+		return nil, nil, nil, err
 	}
+	ctx = logger.CtxWWithLogger(ctx, logBase)
 
-	logger.Info(context.Background(), "Starting HomeCloud File Service...")
+	logBase.Info(ctx, "Config loaded successfully")
 
 	// Инициализируем gRPC клиент для аутентификации
 	authClient, err := auth.NewGRPCAuthClient(cfg)
 	if err != nil {
-		logger.Error(context.Background(), "Failed to create auth client", zap.Error(err))
-		log.Fatalf("Failed to create auth client: %v", err)
+		logBase.Error(ctx, "Failed to create auth client", zap.Error(err))
+		return nil, nil, nil, err
 	}
 	defer authClient.Close()
+	logBase.Info(ctx, "Auth client initialized successfully")
 
 	// Инициализируем репозитории
 	fileRepo, err := repository.NewFileRepository(cfg)
 	if err != nil {
-		logger.Error(context.Background(), "Failed to create file repository", zap.Error(err))
-		log.Fatalf("Failed to create file repository: %v", err)
+		logBase.Error(ctx, "Failed to create file repository", zap.Error(err))
+		return nil, nil, nil, err
 	}
+	logBase.Info(ctx, "File repository initialized successfully")
 
 	storageRepo, err := repository.NewStorageRepository(cfg)
 	if err != nil {
-		logger.Error(context.Background(), "Failed to create storage repository", zap.Error(err))
-		log.Fatalf("Failed to create storage repository: %v", err)
+		logBase.Error(ctx, "Failed to create storage repository", zap.Error(err))
+		return nil, nil, nil, err
 	}
+	logBase.Info(ctx, "Storage repository initialized successfully")
 
 	// Инициализируем сервисы
 	fileService := service.NewFileService(fileRepo, storageRepo, cfg)
 	storageService := service.NewStorageService(storageRepo, cfg)
+	logBase.Info(ctx, "FileService and StorageService initialized successfully")
 
 	// Инициализируем gRPC сервер
 	fileGRPCServer := grpcserver.NewFileServiceServer(storageService, cfg)
@@ -88,53 +117,31 @@ func main() {
 		IdleTimeout:  60 * time.Second,
 	}
 
+	logBase.Info(ctx, "Starting HTTP server", zap.String("address", httpServer.Addr))
+	go func() {
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logBase.Error(ctx, "Failed to start HTTP server", zap.Error(err))
+		}
+	}()
+
 	// Создаем gRPC сервер
 	grpcListener, err := net.Listen("tcp", fmt.Sprintf("%s:%d", cfg.Grpc.Host, cfg.Grpc.Port))
 	if err != nil {
-		logger.Error(context.Background(), "Failed to create gRPC listener", zap.Error(err))
-		log.Fatalf("Failed to create gRPC listener: %v", err)
+		logBase.Error(ctx, "Failed to create gRPC listener", zap.Error(err))
+		return nil, nil, nil, err
 	}
-	defer grpcListener.Close()
 
-	grpcGRPCServer := grpc.NewServer()
+	grpcGRPCServer := grpc.NewServer(
+		grpc.UnaryInterceptor(grpcserver.LoggerInterceptor(logBase)),
+	)
 	pb.RegisterFileServiceServer(grpcGRPCServer, fileGRPCServer)
 
-	// Запускаем HTTP сервер в горутине
+	logBase.Info(ctx, "Starting gRPC server", zap.String("address", grpcListener.Addr().String()))
 	go func() {
-		logger.Info(context.Background(), "Starting HTTP server", zap.String("address", httpServer.Addr))
-		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Error(context.Background(), "Failed to start HTTP server", zap.Error(err))
-			log.Fatalf("Failed to start HTTP server: %v", err)
-		}
-	}()
-
-	// Запускаем gRPC сервер в горутине
-	go func() {
-		logger.Info(context.Background(), "Starting gRPC server", zap.String("address", grpcListener.Addr().String()))
 		if err := grpcGRPCServer.Serve(grpcListener); err != nil {
-			logger.Error(context.Background(), "Failed to start gRPC server", zap.Error(err))
-			log.Fatalf("Failed to start gRPC server: %v", err)
+			logBase.Error(ctx, "Failed to start gRPC server", zap.Error(err))
 		}
 	}()
 
-	// Ждем сигнала для graceful shutdown
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
-
-	logger.Info(context.Background(), "Shutting down servers...")
-
-	// Graceful shutdown
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	// Останавливаем gRPC сервер
-	grpcGRPCServer.GracefulStop()
-
-	// Останавливаем HTTP сервер
-	if err := httpServer.Shutdown(ctx); err != nil {
-		logger.Error(ctx, "HTTP server forced to shutdown", zap.Error(err))
-	}
-
-	logger.Info(context.Background(), "Servers exited")
+	return httpServer, logBase, grpcGRPCServer, nil
 }

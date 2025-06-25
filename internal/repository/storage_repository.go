@@ -11,8 +11,10 @@ import (
 
 	"homecloud-file-service/config"
 	"homecloud-file-service/internal/interfaces"
+	"homecloud-file-service/internal/logger"
 
 	"github.com/google/uuid"
+	"go.uber.org/zap"
 )
 
 type storageRepository struct {
@@ -85,6 +87,8 @@ func (r *storageRepository) createUserDirectory(userID uuid.UUID) error {
 
 // Операции с файлами в хранилище
 func (r *storageRepository) SaveFile(ctx context.Context, path string, content []byte) error {
+	lg := logger.GetLoggerFromCtx(ctx)
+	lg.Info(ctx, "SaveFile (repo) called", zap.String("path", path))
 	// Валидация пути
 	validPath, err := r.validateFilePath(path)
 	if err != nil {

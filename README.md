@@ -1,6 +1,6 @@
 # HomeCloud File Service
 
-Файловый сервис для системы HomeCloud, предоставляющий REST API для управления файлами и папками с поддержкой версионирования, прав доступа и проверки целостности.
+Файловый сервис для системы HomeCloud, предоставляющий REST API для управления файлами и папками с поддержкой версионирования, прав доступа, навигации по папкам и проверки целостности.
 
 ## Архитектура
 
@@ -19,30 +19,40 @@ homecloud-file-service/
 │   ├── auth/
 │   │   ├── grpc_client.go          # gRPC клиент для аутентификации
 │   │   └── middleware.go           # Middleware для аутентификации
+│   ├── dbmanager/
+│   │   └── grpc_client.go          # gRPC клиент для работы с БД
 │   ├── errdefs/
 │   │   └── errdefs.go             # Определения ошибок
 │   ├── interfaces/
 │   │   ├── repository.go          # Интерфейсы репозиториев
-│   │   └── service.go             # Интерфейсы сервисов
+│   │   ├── service.go             # Интерфейсы сервисов
+│   │   └── dbmanager.go           # Интерфейс DBManager клиента
 │   ├── logger/
 │   │   └── logger.go              # Логирование
 │   ├── models/
 │   │   └── file_model.go          # Модели данных
 │   ├── repository/
 │   │   ├── file_repository.go     # Репозиторий файлов
-│   │   └── storage_repository.go  # Репозиторий хранилища (с логикой из Python)
+│   │   └── storage_repository.go  # Репозиторий хранилища
 │   ├── service/
 │   │   ├── file_service.go        # Сервис файлов
 │   │   └── storage_service.go     # Сервис хранилища
 │   └── transport/
 │       ├── grpc/
-│       │   └── protos/
-│       │       ├── auth_grpc.pb.go # Сгенерированный gRPC код
-│       │       ├── auth.pb.go
-│       │       └── auth.proto     # Proto файл для аутентификации
+│       │   ├── protos/
+│       │   │   ├── auth_grpc.pb.go # Сгенерированный gRPC код
+│       │   │   ├── auth.pb.go
+│       │   │   ├── auth.proto     # Proto файл для аутентификации
+│       │   │   ├── db_service_grpc.pb.go
+│       │   │   ├── db_service.pb.go
+│       │   │   ├── db_service.proto # Proto файл для работы с БД
+│       │   │   ├── file_service_grpc.pb.go
+│       │   │   ├── file_service.pb.go
+│       │   │   └── file_service.proto # Proto файл для файлового сервиса
+│       │   └── server.go          # gRPC сервер
 │       └── http/
 │           └── api/
-│               └── handler.go     # HTTP обработчики (с логикой из Python)
+│               └── handler.go     # HTTP обработчики
 ├── migrations/
 │   ├── 001_create_files_table.up.sql
 │   ├── 001_create_files_table.down.sql
@@ -66,8 +76,9 @@ homecloud-file-service/
 1. **Transport Layer** (`internal/transport/`) - HTTP API, gRPC
 2. **Service Layer** (`internal/service/`) - Бизнес-логика
 3. **Repository Layer** (`internal/repository/`) - Доступ к данным
-4. **Models** (`internal/models/`) - Структуры данных
-5. **Interfaces** (`internal/interfaces/`) - Контракты между слоями
+4. **DBManager Client** (`internal/dbmanager/`) - gRPC клиент для работы с БД
+5. **Models** (`internal/models/`) - Структуры данных
+6. **Interfaces** (`internal/interfaces/`) - Контракты между слоями
 
 ## Логика хранения файлов
 
@@ -93,106 +104,156 @@ storage/
 3. **Создание директорий**: Автоматическое создание папок пользователей
 4. **Оригинальные файлы**: Файлы хранятся в исходном виде без шифрования
 5. **Прямое взаимодействие с ОС**: Репозиторий работает напрямую с файловой системой
+6. **gRPC интеграция**: Все операции с БД выполняются через gRPC DBManager сервис
+7. **Автоматическое создание папок**: При загрузке файла по пути система автоматически создает все необходимые папки
+8. **Навигация по путям**: Поддержка навигации как по ID папок, так и по путям
 
 ## API Endpoints
 
-### Прямые маршруты (как в Python скриптах)
-- `POST /api/v1/upload` - Загрузить файл
-- `GET /api/v1/download` - Скачать файл
+Сервис предоставляет REST API для управления файлами и папками. Все эндпоинты требуют аутентификации через Bearer токен.
 
-### Возобновляемые операции
-- `POST /api/v1/upload/resumable` - Инициализация возобновляемой загрузки
-- `POST /api/v1/upload/resumable/{sessionID}` - Загрузка части файла
-- `GET /api/v1/download/resumable` - Инициализация возобновляемого скачивания
-- `GET /api/v1/download/resumable/{sessionID}` - Скачивание части файла
+### Основные группы эндпоинтов:
 
-### Файлы
-- `POST /api/v1/files` - Создать файл
-- `GET /api/v1/files` - Список файлов
-- `GET /api/v1/files/{id}` - Получить файл
-- `PUT /api/v1/files/{id}` - Обновить файл
-- `DELETE /api/v1/files/{id}` - Удалить файл
-- `POST /api/v1/files/{id}/restore` - Восстановить файл
+- **Файлы**: Создание, чтение, обновление, удаление файлов
+- **Папки**: Создание папок и просмотр их содержимого с поддержкой навигации
+- **Загрузка/скачивание**: Улучшенная загрузка через multipart/form-data и скачивание по путям
+- **Навигация**: Просмотр папок с детализацией и breadcrumbs
+- **Поиск и фильтры**: Поиск файлов, избранное, корзина
+- **Ревизии**: Управление версиями файлов
+- **Права доступа**: Предоставление и отзыв прав доступа
+- **Метаданные**: Работа с метаданными файлов
+- **Целостность**: Проверка целостности и контрольные суммы
+- **Хранилище**: Управление хранилищем
 
-### Загрузка и скачивание по ID
-- `POST /api/v1/files/{id}/upload` - Загрузить файл по ID
-- `GET /api/v1/files/{id}/download` - Скачать файл по ID
-- `GET /api/v1/files/{id}/content` - Получить содержимое
+**Полное описание всех эндпоинтов**: [API Reference](API_REFERENCE.md)
 
-### Папки
-- `POST /api/v1/folders` - Создать папку
-- `GET /api/v1/folders/{id}/contents` - Содержимое папки
+## Быстрый старт
 
-### Поиск и фильтры
-- `GET /api/v1/files/search` - Поиск файлов
-- `GET /api/v1/files/starred` - Избранные файлы
-- `GET /api/v1/files/trashed` - Удаленные файлы
-
-### Ревизии
-- `GET /api/v1/files/{id}/revisions` - Список ревизий
-- `GET /api/v1/files/{id}/revisions/{revisionId}` - Получить ревизию
-- `POST /api/v1/files/{id}/revisions/{revisionId}/restore` - Восстановить ревизию
-
-### Права доступа
-- `GET /api/v1/files/{id}/permissions` - Список прав
-- `POST /api/v1/files/{id}/permissions` - Предоставить права
-- `DELETE /api/v1/files/{id}/permissions/{granteeId}` - Отозвать права
-
-### Специальные операции
-- `POST /api/v1/files/{id}/star` - Добавить в избранное
-- `POST /api/v1/files/{id}/unstar` - Убрать из избранного
-- `POST /api/v1/files/{id}/move` - Переместить файл
-- `POST /api/v1/files/{id}/copy` - Копировать файл
-- `POST /api/v1/files/{id}/rename` - Переименовать файл
-
-### Метаданные
-- `GET /api/v1/files/{id}/metadata` - Получить метаданные
-- `PUT /api/v1/files/{id}/metadata` - Обновить метаданные
-
-### Целостность
-- `POST /api/v1/files/{id}/verify` - Проверить целостность
-- `POST /api/v1/files/{id}/checksums` - Вычислить контрольные суммы
-
-### Хранилище
-- `GET /api/v1/storage/info` - Информация о хранилище
-- `POST /api/v1/storage/cleanup` - Очистка хранилища
-- `POST /api/v1/storage/optimize` - Оптимизация хранилища
+Для быстрого запуска и тестирования сервиса см. [QUICKSTART.md](QUICKSTART.md)
 
 ## Примеры использования
 
-### Загрузка файла
+### Загрузка файла с автоматическим созданием папок
 ```bash
-curl -X POST "http://localhost:8080/api/v1/upload" \
-  -H "Content-Type: application/json" \
+curl -X POST "http://localhost:8082/api/v1/upload" \
   -H "Authorization: Bearer YOUR_TOKEN" \
-  -d '{"filePath": "documents/report.pdf"}' \
-  --data-binary @report.pdf
+  -F "file=@report.pdf" \
+  -F "filePath=Documents/Reports/2024/january.pdf"
 ```
 
-### Скачивание файла
+### Создание файла
 ```bash
-curl -X GET "http://localhost:8080/api/v1/download" \
+curl -X POST "http://localhost:8082/api/v1/files" \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer YOUR_TOKEN" \
-  -d '{"filePath": "documents/report.pdf"}' \
-  -o downloaded_report.pdf
+  -d '{
+    "name": "document.pdf",
+    "mime_type": "application/pdf",
+    "size": 1024
+  }'
 ```
 
-### Возобновляемая загрузка
+### Создание папки
 ```bash
-# 1. Инициализация сессии
-curl -X POST "http://localhost:8080/api/v1/upload/resumable" \
+curl -X POST "http://localhost:8082/api/v1/folders" \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer YOUR_TOKEN" \
-  -d '{"filePath": "large_file.zip", "size": 1048576, "sha256": "hash"}'
-
-# 2. Загрузка частей
-curl -X POST "http://localhost:8080/api/v1/upload/resumable/SESSION_ID" \
-  -H "Content-Type: application/octet-stream" \
-  -H "Content-Range: bytes 0-1048575/1048576" \
-  -H "Authorization: Bearer YOUR_TOKEN" \
-  --data-binary @chunk1.bin
+  -d '{
+    "name": "Documents",
+    "parent_id": "uuid-optional"
+  }'
 ```
+
+### Просмотр содержимого папки с детализацией
+```bash
+curl -X GET "http://localhost:8082/api/v1/folders/browse?path=Documents/Reports" \
+  -H "Authorization: Bearer YOUR_TOKEN"
+```
+
+### Навигация по пути с breadcrumbs
+```bash
+curl -X GET "http://localhost:8082/api/v1/folders/navigate?path=Documents/Reports/2024" \
+  -H "Authorization: Bearer YOUR_TOKEN"
+```
+
+### Скачивание файла по пути
+```bash
+curl -X GET "http://localhost:8082/api/v1/download?path=Documents/Reports/2024/january.pdf" \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -o january.pdf
+```
+
+## Модели данных
+
+### File
+```json
+{
+  "id": "uuid",
+  "owner_id": "uuid",
+  "parent_id": "uuid-optional",
+  "name": "filename.pdf",
+  "file_extension": ".pdf",
+  "mime_type": "application/pdf",
+  "storage_path": "storage/users/uuid/filename.pdf",
+  "size": 1024,
+  "md5_checksum": "hash",
+  "sha256_checksum": "hash",
+  "is_folder": false,
+  "is_trashed": false,
+  "trashed_at": "2023-01-01T00:00:00Z",
+  "starred": false,
+  "created_at": "2023-01-01T00:00:00Z",
+  "updated_at": "2023-01-01T00:00:00Z",
+  "last_viewed_at": "2023-01-01T00:00:00Z",
+  "viewed_by_me": false,
+  "version": 1,
+  "revision_id": "uuid-optional",
+  "indexable_text": "text content",
+  "thumbnail_link": "url",
+  "web_view_link": "url",
+  "web_content_link": "url",
+  "icon_link": "url"
+}
+```
+
+### FileRevision
+```json
+{
+  "id": "uuid",
+  "file_id": "uuid",
+  "revision_id": 1,
+  "size": 1024,
+  "storage_path": "storage/users/uuid/filename_v1.pdf",
+  "mime_type": "application/pdf",
+  "md5_checksum": "hash",
+  "user_id": "uuid",
+  "created_at": "2023-01-01T00:00:00Z"
+}
+```
+
+### FilePermission
+```json
+{
+  "id": "uuid",
+  "file_id": "uuid",
+  "grantee_id": "uuid",
+  "grantee_type": "USER|GROUP|DOMAIN|ANYONE",
+  "role": "OWNER|ORGANIZER|FILE_OWNER|WRITER|COMMENTER|READER",
+  "allow_share": true,
+  "created_at": "2023-01-01T00:00:00Z"
+}
+```
+
+## Коды ответов
+
+- `200 OK` - Успешная операция
+- `201 Created` - Ресурс создан
+- `400 Bad Request` - Неверный запрос
+- `401 Unauthorized` - Не авторизован
+- `403 Forbidden` - Доступ запрещен
+- `404 Not Found` - Ресурс не найден
+- `409 Conflict` - Конфликт (например, файл уже существует)
+- `500 Internal Server Error` - Внутренняя ошибка сервера
 
 ## Установка и запуск
 
