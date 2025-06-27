@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -23,7 +24,20 @@ import (
 	"google.golang.org/grpc"
 )
 
+func ensureUsersStorageDir() {
+	path := "storage/users"
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		if err := os.MkdirAll(path, 0755); err != nil {
+			log.Fatalf("Failed to create users storage directory: %v", err)
+		}
+		log.Printf("Directory %s created successfully", path)
+	} else {
+		log.Printf("Directory %s already exists", path)
+	}
+}
+
 func main() {
+	ensureUsersStorageDir()
 	ctx := context.Background()
 	ctx, cancel := signal.NotifyContext(ctx, os.Interrupt)
 	defer cancel()
