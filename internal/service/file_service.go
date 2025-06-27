@@ -444,112 +444,45 @@ func (s *fileService) GetFileContent(ctx context.Context, fileID uuid.UUID, user
 
 // Операции со списками файлов
 func (s *fileService) ListFiles(ctx context.Context, req *models.FileListRequest) (*models.FileListResponse, error) {
-	fmt.Printf("fileService.ListFiles: called with req: %+v\n", req)
-	lg := logger.GetLoggerFromCtxSafe(ctx)
-	if lg != nil {
-		lg.Info(ctx, "ListFiles called", zap.Any("req", req))
-	}
-
-	// Создаем директорию пользователя, если её нет
-	userDir := fmt.Sprintf("%s", req.OwnerID.String())
-	if err := s.storageRepo.CreateDirectory(ctx, userDir); err != nil {
-		fmt.Printf("fileService.ListFiles: failed to create user directory: %v\n", err)
-		if lg != nil {
-			lg.Error(ctx, "Failed to create user directory", zap.Error(err))
-		}
-		return nil, fmt.Errorf("failed to create user directory: %w", err)
-	}
-
-	// Проверяем, есть ли запись о корневой папке в БД
-	rootFolder, err := s.fileRepo.GetFileByPath(ctx, req.OwnerID, "")
-	if err != nil || rootFolder == nil {
-		// Создаём запись о корневой папке
-		rootFile := &models.File{
-			ID:          uuid.New(),
-			OwnerID:     req.OwnerID,
-			ParentID:    nil,
-			Name:        "root",
-			IsFolder:    true,
-			MimeType:    "application/x-directory",
-			Size:        0,
-			StoragePath: userDir,
-			CreatedAt:   time.Now(),
-			UpdatedAt:   time.Now(),
-		}
-		if err := s.fileRepo.CreateFile(ctx, rootFile); err != nil {
-			fmt.Printf("fileService.ListFiles: failed to create root folder in DB: %v\n", err)
-			if lg != nil {
-				lg.Error(ctx, "Failed to create root folder in DB", zap.Error(err))
-			}
-			return nil, fmt.Errorf("failed to create root folder in DB: %w", err)
-		}
-		// Создаём базовые права только для пользователя
-		perm := &models.FilePermission{
-			ID:          uuid.New(),
-			FileID:      rootFile.ID,
-			GranteeID:   &req.OwnerID,
-			GranteeType: models.GranteeTypeUser,
-			Role:        models.RoleOwner,
-			AllowShare:  false,
-			CreatedAt:   time.Now(),
-		}
-		_ = s.fileRepo.CreatePermission(ctx, perm) // Ошибку можно залогировать, но не критично
-	}
+	lg := logger.GetLoggerFromCtx(ctx)
+	userDir := s.getUserDirPath(req.OwnerID)
 
 	// Получаем список файлов из файловой системы
-	fmt.Printf("fileService.ListFiles: calling storageRepo.ListDirectory for path: %s\n", userDir)
 	fileNames, err := s.storageRepo.ListDirectory(ctx, userDir)
 	if err != nil {
-		fmt.Printf("fileService.ListFiles: error from storageRepo: %v\n", err)
 		if lg != nil {
 			lg.Error(ctx, "Failed to list files from storage", zap.Error(err))
 		}
 		return nil, fmt.Errorf("failed to list files: %w", err)
 	}
 
-	fmt.Printf("fileService.ListFiles: got %d files from storage\n", len(fileNames))
-
-	// Преобразуем имена файлов в структуры File
 	var files []models.File
 	for _, fileName := range fileNames {
 		filePath := fmt.Sprintf("%s/%s", userDir, fileName)
-
-		// Получаем информацию о файле
 		fileInfo, err := s.storageRepo.GetFileInfo(ctx, filePath)
 		if err != nil {
-			fmt.Printf("fileService.ListFiles: failed to get file info for %s: %v\n", filePath, err)
 			continue // Пропускаем файл, если не можем получить информацию
 		}
-
 		file := models.File{
-			ID:          uuid.New(), // Генерируем временный ID
 			Name:        fileName,
 			Size:        fileInfo.Size,
 			IsFolder:    fileInfo.IsDirectory,
 			OwnerID:     req.OwnerID,
 			StoragePath: filePath,
-			CreatedAt:   time.Now(),                        // Используем текущее время
-			UpdatedAt:   time.Unix(fileInfo.ModifiedAt, 0), // Конвертируем из int64
+			CreatedAt:   time.Now(),
+			UpdatedAt:   time.Unix(fileInfo.ModifiedAt, 0),
 		}
-
-		// Определяем MIME тип
 		if fileInfo.IsDirectory {
 			file.MimeType = "application/x-directory"
 		} else {
-			file.MimeType = "application/octet-stream" // Базовый тип, можно улучшить
+			file.MimeType = "application/octet-stream"
 		}
-
 		files = append(files, file)
 	}
 
 	response := &models.FileListResponse{
 		Files: files,
 		Total: int64(len(files)),
-	}
-
-	fmt.Printf("fileService.ListFiles: returning response with %d files\n", len(files))
-	if lg != nil {
-		lg.Info(ctx, "Files listed successfully", zap.Int("count", len(files)), zap.Int64("total", response.Total))
 	}
 	return response, nil
 }
@@ -1321,4 +1254,9 @@ func (s *fileService) GetFileDetails(ctx context.Context, userID uuid.UUID, file
 		lg.Info(ctx, "File details retrieved successfully", zap.String("fileID", file.ID.String()))
 	}
 	return file, nil
+}
+
+// getUserDirPath возвращает путь к директории пользователя
+func (s *fileService) getUserDirPath(userID uuid.UUID) string {
+	return userID.String()
 }

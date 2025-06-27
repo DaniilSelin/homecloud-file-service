@@ -84,7 +84,6 @@ func run(ctx context.Context, w io.Writer, args []string) (*http.Server, *logger
 		logBase.Error(ctx, "Failed to create auth client", zap.Error(err))
 		return nil, nil, nil, err
 	}
-	defer authClient.Close()
 	logBase.Info(ctx, "Auth client initialized successfully")
 
 	// Инициализируем репозитории

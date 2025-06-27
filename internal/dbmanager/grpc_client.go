@@ -31,6 +31,9 @@ var _ interfaces.DBManagerClient = (*GRPCDBClient)(nil)
 
 // NewGRPCDBClient создает новый gRPC клиент для dbmanager
 func NewGRPCDBClient(cfg *config.Config) (*GRPCDBClient, error) {
+	// Логируем конфигурацию для диагностики
+	fmt.Printf("NewGRPCDBClient: DbManager config - Host: '%s', Port: %d\n", cfg.DbManager.Host, cfg.DbManager.Port)
+
 	// Настраиваем параметры соединения
 	keepaliveParams := keepalive.ClientParameters{
 		Time:                30 * time.Second,
@@ -39,15 +42,20 @@ func NewGRPCDBClient(cfg *config.Config) (*GRPCDBClient, error) {
 	}
 
 	// Создаем соединение
+	addr := fmt.Sprintf("%s:%d", cfg.DbManager.Host, cfg.DbManager.Port)
+	fmt.Printf("NewGRPCDBClient: Connecting to dbmanager at: %s\n", addr)
+
 	conn, err := grpc.Dial(
-		fmt.Sprintf("%s:%d", cfg.DbManager.Host, cfg.DbManager.Port),
+		addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithKeepaliveParams(keepaliveParams),
 	)
 	if err != nil {
+		fmt.Printf("NewGRPCDBClient: Failed to connect to dbmanager at %s: %v\n", addr, err)
 		return nil, fmt.Errorf("failed to connect to dbmanager: %w", err)
 	}
 
+	fmt.Printf("NewGRPCDBClient: Successfully connected to dbmanager at %s\n", addr)
 	client := pb.NewDBServiceClient(conn)
 
 	return &GRPCDBClient{

@@ -26,16 +26,16 @@ func NewGRPCAuthClient(cfg *config.Config) (*GRPCAuthClient, error) {
 	// Формируем адрес auth сервиса
 	authAddr := fmt.Sprintf("%s:%d", cfg.Auth.Host, cfg.Auth.Port)
 
+	fmt.Printf("Creating gRPC auth client for address: %s\n", authAddr)
+
 	// Устанавливаем соединение
 	conn, err := grpc.Dial(authAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		// В режиме разработки создаем заглушку, если auth service недоступен
-		fmt.Printf("Warning: Auth service not available at %s, using test mode\n", authAddr)
-		return &GRPCAuthClient{
-			client: nil,
-			conn:   nil,
-		}, nil
+		fmt.Printf("Failed to connect to auth service at %s: %v\n", authAddr, err)
+		return nil, fmt.Errorf("failed to connect to auth service at %s: %w", authAddr, err)
 	}
+
+	fmt.Printf("Successfully connected to auth service at %s\n", authAddr)
 
 	// Создаем клиент
 	client := protos.NewAuthServiceClient(conn)
@@ -61,14 +61,25 @@ func (c *GRPCAuthClient) ValidateToken(ctx context.Context, token string) (*prot
 		lg.Info(ctx, "ValidateToken called", zap.String("token", token))
 	}
 
+	fmt.Printf("ValidateToken: Starting validation for token: %s\n", token[:20]+"...")
+
+	// Проверяем, что клиент доступен
+	if c.client == nil {
+		fmt.Printf("ValidateToken: Auth service client is not available\n")
+		return nil, fmt.Errorf("auth service client is not available")
+	}
+
 	// Убираем префикс "Bearer " если есть
 	token = strings.TrimPrefix(token, "Bearer ")
+	fmt.Printf("ValidateToken: Token after trimming: %s\n", token[:20]+"...")
 
 	// Вызываем gRPC метод
+	fmt.Printf("ValidateToken: Calling gRPC ValidateToken method\n")
 	resp, err := c.client.ValidateToken(ctx, &protos.ValidateTokenRequest{
 		Token: token,
 	})
 	if err != nil {
+		fmt.Printf("ValidateToken: gRPC call failed: %v\n", err)
 		if lg != nil {
 			lg.Error(ctx, "failed to validate token", zap.Error(err))
 		} else {
@@ -77,6 +88,7 @@ func (c *GRPCAuthClient) ValidateToken(ctx context.Context, token string) (*prot
 		return nil, fmt.Errorf("failed to validate token: %w", err)
 	}
 
+	fmt.Printf("ValidateToken: gRPC call successful, user ID: %s\n", resp.User.Id)
 	return resp.User, nil
 }
 
