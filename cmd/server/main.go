@@ -100,7 +100,7 @@ func run(ctx context.Context, w io.Writer, args []string) (*http.Server, *logger
 	handler := api.NewHandler(fileService, storageService, authClient)
 
 	// Настраиваем маршруты
-	router := api.SetupRoutes(handler)
+	router := api.SetupRoutes(handler, logBase)
 
 	// Добавляем health check
 	router.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {

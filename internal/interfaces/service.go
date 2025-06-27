@@ -60,6 +60,9 @@ type FileService interface {
 	// Проверка целостности
 	VerifyFileIntegrity(ctx context.Context, fileID uuid.UUID, userID uuid.UUID) (bool, error)
 	CalculateFileChecksums(ctx context.Context, fileID uuid.UUID, userID uuid.UUID) error
+
+	// Операции с детальной информацией
+	GetFileDetails(ctx context.Context, userID uuid.UUID, filePath string) (*models.File, error)
 }
 
 // StorageService интерфейс для работы с файловым хранилищем

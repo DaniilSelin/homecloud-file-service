@@ -6,13 +6,13 @@ import (
 	"strings"
 
 	"homecloud-file-service/config"
-	"homecloud-file-service/internal/transport/grpc/protos"
 	"homecloud-file-service/internal/logger"
+	"homecloud-file-service/internal/transport/grpc/protos"
 
 	"github.com/google/uuid"
+	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	"go.uber.org/zap"
 )
 
 // GRPCAuthClient gRPC клиент для работы с auth сервисом
@@ -54,7 +54,13 @@ func (c *GRPCAuthClient) Close() error {
 // ValidateToken проверяет токен и возвращает информацию о пользователе
 func (c *GRPCAuthClient) ValidateToken(ctx context.Context, token string) (*protos.AuthUser, error) {
 	lg := logger.GetLoggerFromCtx(ctx)
-	lg.Info(ctx, "ValidateToken called", zap.String("token", token))
+	if lg == nil {
+		// Fallback логирование если logger недоступен
+		fmt.Printf("Warning: Logger not available in context for ValidateToken\n")
+	} else {
+		lg.Info(ctx, "ValidateToken called", zap.String("token", token))
+	}
+
 	// Убираем префикс "Bearer " если есть
 	token = strings.TrimPrefix(token, "Bearer ")
 
@@ -63,7 +69,11 @@ func (c *GRPCAuthClient) ValidateToken(ctx context.Context, token string) (*prot
 		Token: token,
 	})
 	if err != nil {
-		lg.Error(ctx, "failed to validate token", zap.Error(err))
+		if lg != nil {
+			lg.Error(ctx, "failed to validate token", zap.Error(err))
+		} else {
+			fmt.Printf("Error: failed to validate token: %v\n", err)
+		}
 		return nil, fmt.Errorf("failed to validate token: %w", err)
 	}
 

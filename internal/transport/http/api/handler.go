@@ -38,7 +38,7 @@ func NewHandler(fileService interfaces.FileService, storageService interfaces.St
 }
 
 // SetupRoutes настраивает маршруты API
-func SetupRoutes(handler *Handler) *mux.Router {
+func SetupRoutes(handler *Handler, log *logger.Logger) *mux.Router {
 	router := mux.NewRouter()
 
 	// Health check endpoint (без аутентификации)
@@ -49,6 +49,8 @@ func SetupRoutes(handler *Handler) *mux.Router {
 	api := router.PathPrefix("/api/v1").Subrouter()
 
 	// Применяем middleware только к API маршрутам
+	// Сначала добавляем logger в контекст, затем проверяем аутентификацию
+	api.Use(auth.LoggerMiddleware(log))
 	api.Use(auth.AuthMiddleware(handler.authClient))
 
 	// Файлы
@@ -58,6 +60,9 @@ func SetupRoutes(handler *Handler) *mux.Router {
 	api.HandleFunc("/files/{id}", handler.UpdateFile).Methods("PUT", "PATCH")
 	api.HandleFunc("/files/{id}", handler.DeleteFile).Methods("DELETE")
 	api.HandleFunc("/files/{id}/restore", handler.RestoreFile).Methods("POST")
+
+	// Детальная информация о файле по пути
+	api.HandleFunc("/files/details", handler.GetFileDetails).Methods("GET")
 
 	// Загрузка и скачивание (прямые маршруты как в Python)
 	api.HandleFunc("/upload", handler.UploadFile).Methods("POST")
@@ -145,7 +150,7 @@ func (h *Handler) respondWithError(w http.ResponseWriter, statusCode int, messag
 
 // ensureFolderPath создает папки по указанному пути и возвращает ID последней папки
 func (h *Handler) ensureFolderPath(ctx context.Context, userID uuid.UUID, folderPath string) (*uuid.UUID, error) {
-	lg := logger.GetLoggerFromCtx(ctx)
+	lg := logger.GetLoggerFromCtxSafe(ctx)
 
 	// Разбиваем путь на части
 	parts := strings.Split(folderPath, "/")
@@ -159,7 +164,9 @@ func (h *Handler) ensureFolderPath(ctx context.Context, userID uuid.UUID, folder
 		// Создаем папку
 		folder, err := h.fileService.CreateFolder(ctx, part, currentParentID, userID)
 		if err != nil {
-			lg.Error(ctx, "Failed to create folder", zap.Error(err), zap.String("name", part))
+			if lg != nil {
+				lg.Error(ctx, "Failed to create folder", zap.Error(err), zap.String("name", part))
+			}
 			return nil, err
 		}
 
@@ -171,7 +178,7 @@ func (h *Handler) ensureFolderPath(ctx context.Context, userID uuid.UUID, folder
 
 // findFolderByPath находит папку по указанному пути
 func (h *Handler) findFolderByPath(ctx context.Context, userID uuid.UUID, folderPath string) (*uuid.UUID, error) {
-	lg := logger.GetLoggerFromCtx(ctx)
+	lg := logger.GetLoggerFromCtxSafe(ctx)
 
 	// Если путь пустой или корневой, возвращаем nil (корневая папка)
 	if folderPath == "" || folderPath == "." || folderPath == "/" {
@@ -190,7 +197,9 @@ func (h *Handler) findFolderByPath(ctx context.Context, userID uuid.UUID, folder
 		// Получаем содержимое текущей папки
 		files, err := h.fileService.ListFolderContents(ctx, currentParentID, userID)
 		if err != nil {
-			lg.Error(ctx, "Failed to list folder contents", zap.Error(err))
+			if lg != nil {
+				lg.Error(ctx, "Failed to list folder contents", zap.Error(err))
+			}
 			return nil, err
 		}
 
@@ -215,7 +224,7 @@ func (h *Handler) findFolderByPath(ctx context.Context, userID uuid.UUID, folder
 
 // findFileByPath находит файл по указанному пути
 func (h *Handler) findFileByPath(ctx context.Context, userID uuid.UUID, filePath string) (*models.File, error) {
-	lg := logger.GetLoggerFromCtx(ctx)
+	lg := logger.GetLoggerFromCtxSafe(ctx)
 
 	// Разбиваем путь на части
 	dirPath := filepath.Dir(filePath)
@@ -227,7 +236,9 @@ func (h *Handler) findFileByPath(ctx context.Context, userID uuid.UUID, filePath
 		var err error
 		parentID, err = h.findFolderByPath(ctx, userID, dirPath)
 		if err != nil {
-			lg.Error(ctx, "Failed to find parent folder", zap.Error(err), zap.String("dirPath", dirPath))
+			if lg != nil {
+				lg.Error(ctx, "Failed to find parent folder", zap.Error(err), zap.String("dirPath", dirPath))
+			}
 			return nil, err
 		}
 	}
@@ -235,7 +246,9 @@ func (h *Handler) findFileByPath(ctx context.Context, userID uuid.UUID, filePath
 	// Получаем содержимое папки
 	files, err := h.fileService.ListFolderContents(ctx, parentID, userID)
 	if err != nil {
-		lg.Error(ctx, "Failed to list folder contents", zap.Error(err))
+		if lg != nil {
+			lg.Error(ctx, "Failed to list folder contents", zap.Error(err))
+		}
 		return nil, err
 	}
 
@@ -284,8 +297,10 @@ var rangeDownloadRegex = regexp.MustCompile(`bytes=(\d+)-(\d*)`)
 
 // Обработчики файлов
 func (h *Handler) CreateFile(w http.ResponseWriter, r *http.Request) {
-	lg := logger.GetLoggerFromCtx(r.Context())
-	lg.Info(r.Context(), "CreateFile handler called")
+	lg := logger.GetLoggerFromCtxSafe(r.Context())
+	if lg != nil {
+		lg.Info(r.Context(), "CreateFile handler called")
+	}
 
 	// Получаем userID из контекста
 	userID, err := h.getUserIDFromRequest(r)
@@ -294,10 +309,10 @@ func (h *Handler) CreateFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Парсим JSON запрос
+	// Парсим JSON из тела запроса
 	var req models.CreateFileRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid request body")
+		h.respondWithError(w, http.StatusBadRequest, "Invalid JSON")
 		return
 	}
 
@@ -308,19 +323,23 @@ func (h *Handler) CreateFile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Создаем файл
-	file, err := h.fileService.CreateFile(r.Context(), &req, userID)
+	createdFile, err := h.fileService.CreateFile(r.Context(), &req, userID)
 	if err != nil {
-		lg.Error(r.Context(), "Failed to create file", zap.Error(err))
+		if lg != nil {
+			lg.Error(r.Context(), "Failed to create file", zap.Error(err))
+		}
 		h.respondWithError(w, http.StatusInternalServerError, "Failed to create file")
 		return
 	}
 
-	h.respondWithJSON(w, http.StatusCreated, file)
+	h.respondWithJSON(w, http.StatusCreated, createdFile)
 }
 
 func (h *Handler) GetFile(w http.ResponseWriter, r *http.Request) {
-	lg := logger.GetLoggerFromCtx(r.Context())
-	lg.Info(r.Context(), "GetFile handler called")
+	lg := logger.GetLoggerFromCtxSafe(r.Context())
+	if lg != nil {
+		lg.Info(r.Context(), "GetFile handler called")
+	}
 
 	// Получаем userID из контекста
 	userID, err := h.getUserIDFromRequest(r)
@@ -339,12 +358,10 @@ func (h *Handler) GetFile(w http.ResponseWriter, r *http.Request) {
 	// Получаем файл
 	file, err := h.fileService.GetFile(r.Context(), fileID, userID)
 	if err != nil {
-		lg.Error(r.Context(), "Failed to get file", zap.Error(err))
-		if err.Error() == "access denied" {
-			h.respondWithError(w, http.StatusForbidden, "Access denied")
-		} else {
-			h.respondWithError(w, http.StatusInternalServerError, "Failed to get file")
+		if lg != nil {
+			lg.Error(r.Context(), "Failed to get file", zap.Error(err))
 		}
+		h.respondWithError(w, http.StatusNotFound, "File not found")
 		return
 	}
 
@@ -352,8 +369,10 @@ func (h *Handler) GetFile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) UpdateFile(w http.ResponseWriter, r *http.Request) {
-	lg := logger.GetLoggerFromCtx(r.Context())
-	lg.Info(r.Context(), "UpdateFile handler called")
+	lg := logger.GetLoggerFromCtxSafe(r.Context())
+	if lg != nil {
+		lg.Info(r.Context(), "UpdateFile handler called")
+	}
 
 	// Получаем userID из контекста
 	userID, err := h.getUserIDFromRequest(r)
@@ -369,31 +388,31 @@ func (h *Handler) UpdateFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Парсим JSON запрос
+	// Парсим JSON из тела запроса
 	var req models.UpdateFileRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid request body")
+		h.respondWithError(w, http.StatusBadRequest, "Invalid JSON")
 		return
 	}
 
 	// Обновляем файл
-	file, err := h.fileService.UpdateFile(r.Context(), fileID, &req, userID)
+	updatedFile, err := h.fileService.UpdateFile(r.Context(), fileID, &req, userID)
 	if err != nil {
-		lg.Error(r.Context(), "Failed to update file", zap.Error(err))
-		if err.Error() == "access denied" {
-			h.respondWithError(w, http.StatusForbidden, "Access denied")
-		} else {
-			h.respondWithError(w, http.StatusInternalServerError, "Failed to update file")
+		if lg != nil {
+			lg.Error(r.Context(), "Failed to update file", zap.Error(err))
 		}
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to update file")
 		return
 	}
 
-	h.respondWithJSON(w, http.StatusOK, file)
+	h.respondWithJSON(w, http.StatusOK, updatedFile)
 }
 
 func (h *Handler) DeleteFile(w http.ResponseWriter, r *http.Request) {
-	lg := logger.GetLoggerFromCtx(r.Context())
-	lg.Info(r.Context(), "DeleteFile handler called")
+	lg := logger.GetLoggerFromCtxSafe(r.Context())
+	if lg != nil {
+		lg.Info(r.Context(), "DeleteFile handler called")
+	}
 
 	// Получаем userID из контекста
 	userID, err := h.getUserIDFromRequest(r)
@@ -409,15 +428,13 @@ func (h *Handler) DeleteFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Удаляем файл (мягкое удаление)
+	// Удаляем файл
 	err = h.fileService.DeleteFile(r.Context(), fileID, userID)
 	if err != nil {
-		lg.Error(r.Context(), "Failed to delete file", zap.Error(err))
-		if err.Error() == "access denied" {
-			h.respondWithError(w, http.StatusForbidden, "Access denied")
-		} else {
-			h.respondWithError(w, http.StatusInternalServerError, "Failed to delete file")
+		if lg != nil {
+			lg.Error(r.Context(), "Failed to delete file", zap.Error(err))
 		}
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to delete file")
 		return
 	}
 
@@ -425,8 +442,10 @@ func (h *Handler) DeleteFile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) RestoreFile(w http.ResponseWriter, r *http.Request) {
-	lg := logger.GetLoggerFromCtx(r.Context())
-	lg.Info(r.Context(), "RestoreFile handler called")
+	lg := logger.GetLoggerFromCtxSafe(r.Context())
+	if lg != nil {
+		lg.Info(r.Context(), "RestoreFile handler called")
+	}
 
 	// Получаем userID из контекста
 	userID, err := h.getUserIDFromRequest(r)
@@ -435,7 +454,7 @@ func (h *Handler) RestoreFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Получаем fileID из URL параметров
+	// Парсим ID файла из URL
 	fileID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid file ID")
@@ -445,7 +464,9 @@ func (h *Handler) RestoreFile(w http.ResponseWriter, r *http.Request) {
 	// Восстанавливаем файл
 	err = h.fileService.RestoreFile(r.Context(), fileID, userID)
 	if err != nil {
-		lg.Error(r.Context(), "Failed to restore file", zap.Error(err))
+		if lg != nil {
+			lg.Error(r.Context(), "Failed to restore file", zap.Error(err))
+		}
 		h.respondWithError(w, http.StatusInternalServerError, "Failed to restore file")
 		return
 	}
@@ -454,15 +475,25 @@ func (h *Handler) RestoreFile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListFiles(w http.ResponseWriter, r *http.Request) {
-	lg := logger.GetLoggerFromCtx(r.Context())
-	lg.Info(r.Context(), "ListFiles handler called")
+	fmt.Printf("ListFiles: Handler called for path: %s\n", r.URL.Path)
+
+	lg := logger.GetLoggerFromCtxSafe(r.Context())
+	if lg != nil {
+		lg.Info(r.Context(), "ListFiles handler called")
+		fmt.Printf("ListFiles: Logger available in context\n")
+	} else {
+		fmt.Printf("Warning: Logger not available in context for ListFiles\n")
+	}
 
 	// Получаем userID из контекста
 	userID, err := h.getUserIDFromRequest(r)
 	if err != nil {
+		fmt.Printf("ListFiles: Failed to get userID from request: %v\n", err)
 		h.respondWithError(w, http.StatusUnauthorized, "Unauthorized")
 		return
 	}
+
+	fmt.Printf("ListFiles: UserID from context: %s\n", userID.String())
 
 	// Парсим query параметры
 	query := r.URL.Query()
@@ -525,19 +556,24 @@ func (h *Handler) ListFiles(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Получаем список файлов
+	fmt.Printf("ListFiles: Calling fileService.ListFiles with request: %+v\n", req)
 	response, err := h.fileService.ListFiles(r.Context(), req)
 	if err != nil {
-		lg.Error(r.Context(), "Failed to list files", zap.Error(err))
+		fmt.Printf("ListFiles: Error from fileService.ListFiles: %v\n", err)
+		if lg != nil {
+			lg.Error(r.Context(), "Failed to list files", zap.Error(err))
+		}
 		h.respondWithError(w, http.StatusInternalServerError, "Failed to list files")
 		return
 	}
 
+	fmt.Printf("ListFiles: Successfully got response from fileService: %+v\n", response)
 	h.respondWithJSON(w, http.StatusOK, response)
 }
 
 // Обработчики загрузки и скачивания (прямые маршруты как в Python)
 func (h *Handler) UploadFile(w http.ResponseWriter, r *http.Request) {
-	lg := logger.GetLoggerFromCtx(r.Context())
+	lg := logger.GetLoggerFromCtxSafe(r.Context())
 	lg.Info(r.Context(), "UploadFile handler called")
 
 	// Получаем userID из контекста
@@ -644,7 +680,7 @@ func (h *Handler) UploadFile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) DownloadFile(w http.ResponseWriter, r *http.Request) {
-	lg := logger.GetLoggerFromCtx(r.Context())
+	lg := logger.GetLoggerFromCtxSafe(r.Context())
 	lg.Info(r.Context(), "DownloadFile handler called")
 
 	// Получаем userID из контекста
@@ -706,7 +742,7 @@ func (h *Handler) DownloadFile(w http.ResponseWriter, r *http.Request) {
 
 // Обработчики загрузки и скачивания по ID файла
 func (h *Handler) UploadFileByID(w http.ResponseWriter, r *http.Request) {
-	lg := logger.GetLoggerFromCtx(r.Context())
+	lg := logger.GetLoggerFromCtxSafe(r.Context())
 	lg.Info(r.Context(), "UploadFileByID handler called")
 
 	// Получаем userID из контекста
@@ -745,7 +781,7 @@ func (h *Handler) UploadFileByID(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) DownloadFileByID(w http.ResponseWriter, r *http.Request) {
-	lg := logger.GetLoggerFromCtx(r.Context())
+	lg := logger.GetLoggerFromCtxSafe(r.Context())
 	lg.Info(r.Context(), "DownloadFileByID handler called")
 
 	// Получаем userID из контекста
@@ -785,7 +821,7 @@ func (h *Handler) DownloadFileByID(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) GetFileContent(w http.ResponseWriter, r *http.Request) {
-	lg := logger.GetLoggerFromCtx(r.Context())
+	lg := logger.GetLoggerFromCtxSafe(r.Context())
 	lg.Info(r.Context(), "GetFileContent handler called")
 
 	// Получаем userID из контекста
@@ -1033,7 +1069,7 @@ func (h *Handler) ResumableDownload(w http.ResponseWriter, r *http.Request) {
 
 // Остальные обработчики (заглушки)
 func (h *Handler) CreateFolder(w http.ResponseWriter, r *http.Request) {
-	lg := logger.GetLoggerFromCtx(r.Context())
+	lg := logger.GetLoggerFromCtxSafe(r.Context())
 	lg.Info(r.Context(), "CreateFolder handler called")
 
 	// Получаем userID из контекста
@@ -1074,7 +1110,7 @@ func (h *Handler) CreateFolder(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListFolderContents(w http.ResponseWriter, r *http.Request) {
-	lg := logger.GetLoggerFromCtx(r.Context())
+	lg := logger.GetLoggerFromCtxSafe(r.Context())
 	lg.Info(r.Context(), "ListFolderContents handler called")
 
 	// Получаем userID из контекста
@@ -1136,7 +1172,7 @@ func (h *Handler) ListFolderContents(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) SearchFiles(w http.ResponseWriter, r *http.Request) {
-	lg := logger.GetLoggerFromCtx(r.Context())
+	lg := logger.GetLoggerFromCtxSafe(r.Context())
 	lg.Info(r.Context(), "SearchFiles handler called")
 
 	// Получаем userID из контекста
@@ -1165,7 +1201,7 @@ func (h *Handler) SearchFiles(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListStarredFiles(w http.ResponseWriter, r *http.Request) {
-	lg := logger.GetLoggerFromCtx(r.Context())
+	lg := logger.GetLoggerFromCtxSafe(r.Context())
 	lg.Info(r.Context(), "ListStarredFiles handler called")
 
 	// Получаем userID из контекста
@@ -1187,7 +1223,7 @@ func (h *Handler) ListStarredFiles(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListTrashedFiles(w http.ResponseWriter, r *http.Request) {
-	lg := logger.GetLoggerFromCtx(r.Context())
+	lg := logger.GetLoggerFromCtxSafe(r.Context())
 	lg.Info(r.Context(), "ListTrashedFiles handler called")
 
 	// Получаем userID из контекста
@@ -1209,7 +1245,7 @@ func (h *Handler) ListTrashedFiles(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListRevisions(w http.ResponseWriter, r *http.Request) {
-	lg := logger.GetLoggerFromCtx(r.Context())
+	lg := logger.GetLoggerFromCtxSafe(r.Context())
 	lg.Info(r.Context(), "ListRevisions handler called")
 
 	// Получаем userID из контекста
@@ -1238,7 +1274,7 @@ func (h *Handler) ListRevisions(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) GetRevision(w http.ResponseWriter, r *http.Request) {
-	lg := logger.GetLoggerFromCtx(r.Context())
+	lg := logger.GetLoggerFromCtxSafe(r.Context())
 	lg.Info(r.Context(), "GetRevision handler called")
 
 	// Получаем userID из контекста
@@ -1276,7 +1312,7 @@ func (h *Handler) GetRevision(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) RestoreRevision(w http.ResponseWriter, r *http.Request) {
-	lg := logger.GetLoggerFromCtx(r.Context())
+	lg := logger.GetLoggerFromCtxSafe(r.Context())
 	lg.Info(r.Context(), "RestoreRevision handler called")
 
 	// Получаем userID из контекста
@@ -1314,7 +1350,7 @@ func (h *Handler) RestoreRevision(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListPermissions(w http.ResponseWriter, r *http.Request) {
-	lg := logger.GetLoggerFromCtx(r.Context())
+	lg := logger.GetLoggerFromCtxSafe(r.Context())
 	lg.Info(r.Context(), "ListPermissions handler called")
 
 	// Получаем userID из контекста
@@ -1343,7 +1379,7 @@ func (h *Handler) ListPermissions(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) GrantPermission(w http.ResponseWriter, r *http.Request) {
-	lg := logger.GetLoggerFromCtx(r.Context())
+	lg := logger.GetLoggerFromCtxSafe(r.Context())
 	lg.Info(r.Context(), "GrantPermission handler called")
 
 	// Получаем userID из контекста
@@ -1407,7 +1443,7 @@ func (h *Handler) GrantPermission(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) RevokePermission(w http.ResponseWriter, r *http.Request) {
-	lg := logger.GetLoggerFromCtx(r.Context())
+	lg := logger.GetLoggerFromCtxSafe(r.Context())
 	lg.Info(r.Context(), "RevokePermission handler called")
 
 	// Получаем userID из контекста
@@ -1445,7 +1481,7 @@ func (h *Handler) RevokePermission(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) StarFile(w http.ResponseWriter, r *http.Request) {
-	lg := logger.GetLoggerFromCtx(r.Context())
+	lg := logger.GetLoggerFromCtxSafe(r.Context())
 	lg.Info(r.Context(), "StarFile handler called")
 
 	// Получаем userID из контекста
@@ -1474,7 +1510,7 @@ func (h *Handler) StarFile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) UnstarFile(w http.ResponseWriter, r *http.Request) {
-	lg := logger.GetLoggerFromCtx(r.Context())
+	lg := logger.GetLoggerFromCtxSafe(r.Context())
 	lg.Info(r.Context(), "UnstarFile handler called")
 
 	// Получаем userID из контекста
@@ -1503,7 +1539,7 @@ func (h *Handler) UnstarFile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) MoveFile(w http.ResponseWriter, r *http.Request) {
-	lg := logger.GetLoggerFromCtx(r.Context())
+	lg := logger.GetLoggerFromCtxSafe(r.Context())
 	lg.Info(r.Context(), "MoveFile handler called")
 
 	// Получаем userID из контекста
@@ -1541,7 +1577,7 @@ func (h *Handler) MoveFile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) CopyFile(w http.ResponseWriter, r *http.Request) {
-	lg := logger.GetLoggerFromCtx(r.Context())
+	lg := logger.GetLoggerFromCtxSafe(r.Context())
 	lg.Info(r.Context(), "CopyFile handler called")
 
 	// Получаем userID из контекста
@@ -1580,7 +1616,7 @@ func (h *Handler) CopyFile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) RenameFile(w http.ResponseWriter, r *http.Request) {
-	lg := logger.GetLoggerFromCtx(r.Context())
+	lg := logger.GetLoggerFromCtxSafe(r.Context())
 	lg.Info(r.Context(), "RenameFile handler called")
 
 	// Получаем userID из контекста
@@ -1618,7 +1654,7 @@ func (h *Handler) RenameFile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) GetFileMetadata(w http.ResponseWriter, r *http.Request) {
-	lg := logger.GetLoggerFromCtx(r.Context())
+	lg := logger.GetLoggerFromCtxSafe(r.Context())
 	lg.Info(r.Context(), "GetFileMetadata handler called")
 
 	// Получаем userID из контекста
@@ -1647,7 +1683,7 @@ func (h *Handler) GetFileMetadata(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) UpdateFileMetadata(w http.ResponseWriter, r *http.Request) {
-	lg := logger.GetLoggerFromCtx(r.Context())
+	lg := logger.GetLoggerFromCtxSafe(r.Context())
 	lg.Info(r.Context(), "UpdateFileMetadata handler called")
 
 	// Получаем userID из контекста
@@ -1683,7 +1719,7 @@ func (h *Handler) UpdateFileMetadata(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) VerifyFileIntegrity(w http.ResponseWriter, r *http.Request) {
-	lg := logger.GetLoggerFromCtx(r.Context())
+	lg := logger.GetLoggerFromCtxSafe(r.Context())
 	lg.Info(r.Context(), "VerifyFileIntegrity handler called")
 
 	// Получаем userID из контекста
@@ -1714,7 +1750,7 @@ func (h *Handler) VerifyFileIntegrity(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) CalculateFileChecksums(w http.ResponseWriter, r *http.Request) {
-	lg := logger.GetLoggerFromCtx(r.Context())
+	lg := logger.GetLoggerFromCtxSafe(r.Context())
 	lg.Info(r.Context(), "CalculateFileChecksums handler called")
 
 	// Получаем userID из контекста
@@ -1743,7 +1779,7 @@ func (h *Handler) CalculateFileChecksums(w http.ResponseWriter, r *http.Request)
 }
 
 func (h *Handler) GetStorageInfo(w http.ResponseWriter, r *http.Request) {
-	lg := logger.GetLoggerFromCtx(r.Context())
+	lg := logger.GetLoggerFromCtxSafe(r.Context())
 	lg.Info(r.Context(), "GetStorageInfo handler called")
 
 	// Получаем информацию о хранилище
@@ -1760,7 +1796,7 @@ func (h *Handler) GetStorageInfo(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) CleanupStorage(w http.ResponseWriter, r *http.Request) {
-	lg := logger.GetLoggerFromCtx(r.Context())
+	lg := logger.GetLoggerFromCtxSafe(r.Context())
 	lg.Info(r.Context(), "CleanupStorage handler called")
 
 	// Очищаем хранилище
@@ -1775,7 +1811,7 @@ func (h *Handler) CleanupStorage(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) OptimizeStorage(w http.ResponseWriter, r *http.Request) {
-	lg := logger.GetLoggerFromCtx(r.Context())
+	lg := logger.GetLoggerFromCtxSafe(r.Context())
 	lg.Info(r.Context(), "OptimizeStorage handler called")
 
 	// Оптимизируем хранилище
@@ -1800,7 +1836,7 @@ func (h *Handler) HealthCheck(w http.ResponseWriter, r *http.Request) {
 
 // BrowseFolder позволяет просматривать содержимое папки с дополнительной информацией
 func (h *Handler) BrowseFolder(w http.ResponseWriter, r *http.Request) {
-	lg := logger.GetLoggerFromCtx(r.Context())
+	lg := logger.GetLoggerFromCtxSafe(r.Context())
 	lg.Info(r.Context(), "BrowseFolder handler called")
 
 	// Получаем userID из контекста
@@ -1833,6 +1869,7 @@ func (h *Handler) BrowseFolder(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// Находим папку по пути
 		foundFolderID, err := h.findFolderByPath(r.Context(), userID, currentPath)
 		if err != nil {
 			lg.Error(r.Context(), "Failed to find folder by path", zap.Error(err), zap.String("path", currentPath))
@@ -1881,7 +1918,7 @@ func (h *Handler) BrowseFolder(w http.ResponseWriter, r *http.Request) {
 
 // NavigateToPath позволяет навигировать по пути и получать информацию о каждом уровне
 func (h *Handler) NavigateToPath(w http.ResponseWriter, r *http.Request) {
-	lg := logger.GetLoggerFromCtx(r.Context())
+	lg := logger.GetLoggerFromCtxSafe(r.Context())
 	lg.Info(r.Context(), "NavigateToPath handler called")
 
 	// Получаем userID из контекста
@@ -1978,4 +2015,46 @@ func (h *Handler) NavigateToPath(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.respondWithJSON(w, http.StatusOK, response)
+}
+
+// GetFileDetails получает детальную информацию о файле по пути
+func (h *Handler) GetFileDetails(w http.ResponseWriter, r *http.Request) {
+	fmt.Printf("GetFileDetails: Handler called for path: %s\n", r.URL.Path)
+
+	lg := logger.GetLoggerFromCtxSafe(r.Context())
+	if lg != nil {
+		lg.Info(r.Context(), "GetFileDetails handler called")
+	}
+
+	// Получаем userID из контекста
+	userID, err := h.getUserIDFromRequest(r)
+	if err != nil {
+		fmt.Printf("GetFileDetails: Failed to get userID from request: %v\n", err)
+		h.respondWithError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	// Получаем путь к файлу из query параметра
+	filePath := r.URL.Query().Get("path")
+	if filePath == "" {
+		fmt.Printf("GetFileDetails: No file path provided\n")
+		h.respondWithError(w, http.StatusBadRequest, "File path is required")
+		return
+	}
+
+	fmt.Printf("GetFileDetails: Getting details for filePath: %s\n", filePath)
+
+	// Получаем детальную информацию о файле
+	file, err := h.fileService.GetFileDetails(r.Context(), userID, filePath)
+	if err != nil {
+		fmt.Printf("GetFileDetails: Error from fileService: %v\n", err)
+		if lg != nil {
+			lg.Error(r.Context(), "Failed to get file details", zap.Error(err))
+		}
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to get file details")
+		return
+	}
+
+	fmt.Printf("GetFileDetails: Successfully got file details\n")
+	h.respondWithJSON(w, http.StatusOK, file)
 }
