@@ -460,6 +460,42 @@ func (s *fileService) ListFiles(ctx context.Context, req *models.FileListRequest
 		return nil, fmt.Errorf("failed to create user directory: %w", err)
 	}
 
+	// Проверяем, есть ли запись о корневой папке в БД
+	rootFolder, err := s.fileRepo.GetFileByPath(ctx, req.OwnerID, "")
+	if err != nil || rootFolder == nil {
+		// Создаём запись о корневой папке
+		rootFile := &models.File{
+			ID:          uuid.New(),
+			OwnerID:     req.OwnerID,
+			ParentID:    nil,
+			Name:        "root",
+			IsFolder:    true,
+			MimeType:    "application/x-directory",
+			Size:        0,
+			StoragePath: userDir,
+			CreatedAt:   time.Now(),
+			UpdatedAt:   time.Now(),
+		}
+		if err := s.fileRepo.CreateFile(ctx, rootFile); err != nil {
+			fmt.Printf("fileService.ListFiles: failed to create root folder in DB: %v\n", err)
+			if lg != nil {
+				lg.Error(ctx, "Failed to create root folder in DB", zap.Error(err))
+			}
+			return nil, fmt.Errorf("failed to create root folder in DB: %w", err)
+		}
+		// Создаём базовые права только для пользователя
+		perm := &models.FilePermission{
+			ID:          uuid.New(),
+			FileID:      rootFile.ID,
+			GranteeID:   &req.OwnerID,
+			GranteeType: models.GranteeTypeUser,
+			Role:        models.RoleOwner,
+			AllowShare:  false,
+			CreatedAt:   time.Now(),
+		}
+		_ = s.fileRepo.CreatePermission(ctx, perm) // Ошибку можно залогировать, но не критично
+	}
+
 	// Получаем список файлов из файловой системы
 	fmt.Printf("fileService.ListFiles: calling storageRepo.ListDirectory for path: %s\n", userDir)
 	fileNames, err := s.storageRepo.ListDirectory(ctx, userDir)
