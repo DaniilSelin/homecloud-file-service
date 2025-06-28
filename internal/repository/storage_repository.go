@@ -88,116 +88,245 @@ func (r *storageRepository) createUserDirectory(userID uuid.UUID) error {
 // Операции с файлами в хранилище
 func (r *storageRepository) SaveFile(ctx context.Context, path string, content []byte) error {
 	lg := logger.GetLoggerFromCtx(ctx)
-	lg.Info(ctx, "SaveFile (repo) called", zap.String("path", path))
+	lg.Info(ctx, "SaveFile (repo) called",
+		zap.String("path", path),
+		zap.Int("contentSize", len(content)))
+
 	// Валидация пути
 	validPath, err := r.validateFilePath(path)
 	if err != nil {
+		lg.Error(ctx, "Path validation failed",
+			zap.Error(err),
+			zap.String("path", path))
 		return fmt.Errorf("path validation failed: %w", err)
 	}
 
+	lg.Debug(ctx, "Path validated successfully",
+		zap.String("originalPath", path),
+		zap.String("validPath", validPath))
+
 	// Создаем директорию, если она не существует
-	if err := os.MkdirAll(filepath.Dir(validPath), 0755); err != nil {
+	dir := filepath.Dir(validPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		lg.Error(ctx, "Failed to create directory",
+			zap.Error(err),
+			zap.String("directory", dir))
 		return fmt.Errorf("failed to create directory: %w", err)
 	}
 
 	// Создаем и открываем файл для записи
 	file, err := os.Create(validPath)
 	if err != nil {
+		lg.Error(ctx, "Failed to create file",
+			zap.Error(err),
+			zap.String("path", validPath))
 		return fmt.Errorf("failed to create file: %w", err)
 	}
 	defer file.Close()
 
 	// Записываем содержимое
-	if _, err := file.Write(content); err != nil {
+	bytesWritten, err := file.Write(content)
+	if err != nil {
+		lg.Error(ctx, "Failed to write file content",
+			zap.Error(err),
+			zap.String("path", validPath),
+			zap.Int("expectedSize", len(content)))
 		return fmt.Errorf("failed to write file: %w", err)
 	}
+
+	lg.Info(ctx, "File saved successfully",
+		zap.String("path", validPath),
+		zap.Int("bytesWritten", bytesWritten),
+		zap.Int("contentSize", len(content)))
 
 	return nil
 }
 
 func (r *storageRepository) GetFile(ctx context.Context, path string) ([]byte, error) {
+	lg := logger.GetLoggerFromCtx(ctx)
+	lg.Info(ctx, "GetFile (repo) called", zap.String("path", path))
+
 	// Валидация пути
 	validPath, err := r.validateFilePath(path)
 	if err != nil {
+		lg.Error(ctx, "Path validation failed",
+			zap.Error(err),
+			zap.String("path", path))
 		return nil, fmt.Errorf("path validation failed: %w", err)
 	}
 
 	// Проверка существования файла
 	fileInfo, err := os.Stat(validPath)
 	if os.IsNotExist(err) {
+		lg.Info(ctx, "File not found", zap.String("path", validPath))
 		return nil, fmt.Errorf("file not found: %s", path)
 	} else if err != nil {
+		lg.Error(ctx, "Failed to access file",
+			zap.Error(err),
+			zap.String("path", validPath))
 		return nil, fmt.Errorf("failed to access file: %w", err)
 	}
 
 	// Проверяем, что это файл, а не директория
 	if fileInfo.IsDir() {
+		lg.Error(ctx, "Path is a directory, not a file",
+			zap.String("path", validPath),
+			zap.Int64("size", fileInfo.Size()))
 		return nil, fmt.Errorf("path is a directory, not a file: %s", path)
 	}
+
+	lg.Debug(ctx, "File info retrieved",
+		zap.String("path", validPath),
+		zap.Int64("size", fileInfo.Size()),
+		zap.Time("modTime", fileInfo.ModTime()))
 
 	// Читаем файл
 	content, err := os.ReadFile(validPath)
 	if err != nil {
+		lg.Error(ctx, "Failed to read file",
+			zap.Error(err),
+			zap.String("path", validPath))
 		return nil, fmt.Errorf("failed to read file: %w", err)
 	}
+
+	lg.Info(ctx, "File retrieved successfully",
+		zap.String("path", validPath),
+		zap.Int("contentSize", len(content)))
 
 	return content, nil
 }
 
 func (r *storageRepository) DeleteFile(ctx context.Context, path string) error {
+	lg := logger.GetLoggerFromCtx(ctx)
+	lg.Info(ctx, "DeleteFile (repo) called", zap.String("path", path))
+
 	// Валидация пути
 	validPath, err := r.validateFilePath(path)
 	if err != nil {
+		lg.Error(ctx, "Path validation failed",
+			zap.Error(err),
+			zap.String("path", path))
 		return fmt.Errorf("path validation failed: %w", err)
+	}
+
+	// Проверяем существование файла перед удалением
+	if _, err := os.Stat(validPath); os.IsNotExist(err) {
+		lg.Info(ctx, "File not found for deletion", zap.String("path", validPath))
+		return fmt.Errorf("file not found: %s", path)
 	}
 
 	// Удаляем файл
 	if err := os.Remove(validPath); err != nil {
+		lg.Error(ctx, "Failed to delete file",
+			zap.Error(err),
+			zap.String("path", validPath))
 		return fmt.Errorf("failed to delete file: %w", err)
 	}
 
+	lg.Info(ctx, "File deleted successfully", zap.String("path", validPath))
 	return nil
 }
 
 func (r *storageRepository) MoveFile(ctx context.Context, oldPath, newPath string) error {
+	lg := logger.GetLoggerFromCtx(ctx)
+	lg.Info(ctx, "MoveFile (repo) called",
+		zap.String("oldPath", oldPath),
+		zap.String("newPath", newPath))
+
 	// Валидация путей
 	validOldPath, err := r.validateFilePath(oldPath)
 	if err != nil {
+		lg.Error(ctx, "Old path validation failed",
+			zap.Error(err),
+			zap.String("oldPath", oldPath))
 		return fmt.Errorf("old path validation failed: %w", err)
 	}
 
 	validNewPath, err := r.validateFilePath(newPath)
 	if err != nil {
+		lg.Error(ctx, "New path validation failed",
+			zap.Error(err),
+			zap.String("newPath", newPath))
 		return fmt.Errorf("new path validation failed: %w", err)
 	}
 
+	// Проверяем существование исходного файла
+	if _, err := os.Stat(validOldPath); os.IsNotExist(err) {
+		lg.Error(ctx, "Source file not found", zap.String("oldPath", validOldPath))
+		return fmt.Errorf("source file not found: %s", oldPath)
+	}
+
 	// Создаем директорию для нового пути
-	if err := os.MkdirAll(filepath.Dir(validNewPath), 0755); err != nil {
+	newDir := filepath.Dir(validNewPath)
+	if err := os.MkdirAll(newDir, 0755); err != nil {
+		lg.Error(ctx, "Failed to create directory",
+			zap.Error(err),
+			zap.String("directory", newDir))
 		return fmt.Errorf("failed to create directory: %w", err)
 	}
 
 	// Перемещаем файл
 	if err := os.Rename(validOldPath, validNewPath); err != nil {
+		lg.Error(ctx, "Failed to move file",
+			zap.Error(err),
+			zap.String("oldPath", validOldPath),
+			zap.String("newPath", validNewPath))
 		return fmt.Errorf("failed to move file: %w", err)
 	}
+
+	lg.Info(ctx, "File moved successfully",
+		zap.String("oldPath", validOldPath),
+		zap.String("newPath", validNewPath))
 
 	return nil
 }
 
 func (r *storageRepository) CopyFile(ctx context.Context, srcPath, dstPath string) error {
+	lg := logger.GetLoggerFromCtx(ctx)
+	lg.Info(ctx, "CopyFile (repo) called",
+		zap.String("srcPath", srcPath),
+		zap.String("dstPath", dstPath))
+
 	// Валидация путей
 	validSrcPath, err := r.validateFilePath(srcPath)
 	if err != nil {
+		lg.Error(ctx, "Source path validation failed",
+			zap.Error(err),
+			zap.String("srcPath", srcPath))
 		return fmt.Errorf("source path validation failed: %w", err)
 	}
 
 	validDstPath, err := r.validateFilePath(dstPath)
 	if err != nil {
+		lg.Error(ctx, "Destination path validation failed",
+			zap.Error(err),
+			zap.String("dstPath", dstPath))
 		return fmt.Errorf("destination path validation failed: %w", err)
 	}
 
+	// Проверяем существование исходного файла
+	srcInfo, err := os.Stat(validSrcPath)
+	if os.IsNotExist(err) {
+		lg.Error(ctx, "Source file not found", zap.String("srcPath", validSrcPath))
+		return fmt.Errorf("source file not found: %s", srcPath)
+	} else if err != nil {
+		lg.Error(ctx, "Failed to access source file",
+			zap.Error(err),
+			zap.String("srcPath", validSrcPath))
+		return fmt.Errorf("failed to access source file: %w", err)
+	}
+
+	lg.Debug(ctx, "Source file info",
+		zap.String("srcPath", validSrcPath),
+		zap.Int64("size", srcInfo.Size()),
+		zap.Time("modTime", srcInfo.ModTime()))
+
 	// Создаем директорию для нового пути
-	if err := os.MkdirAll(filepath.Dir(validDstPath), 0755); err != nil {
+	dstDir := filepath.Dir(validDstPath)
+	if err := os.MkdirAll(dstDir, 0755); err != nil {
+		lg.Error(ctx, "Failed to create destination directory",
+			zap.Error(err),
+			zap.String("directory", dstDir))
 		return fmt.Errorf("failed to create directory: %w", err)
 	}
 

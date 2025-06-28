@@ -107,19 +107,13 @@ func run(ctx context.Context, w io.Writer, args []string) (*http.Server, *logger
 	logBase.Info(ctx, "FileService and StorageService initialized successfully")
 
 	// Инициализируем gRPC сервер
-	fileGRPCServer := grpcserver.NewFileServiceServer(storageService, cfg)
+	fileGRPCServer := grpcserver.NewFileServiceServer(storageService, fileService, cfg)
 
 	// Инициализируем HTTP хэндлеры
 	handler := api.NewHandler(fileService, storageService, authClient)
 
 	// Настраиваем маршруты
 	router := api.SetupRoutes(handler, logBase)
-
-	// Добавляем health check
-	router.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
-	}).Methods("GET")
 
 	// Создаем HTTP сервер
 	httpServer := &http.Server{

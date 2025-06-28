@@ -3,14 +3,15 @@ package grpc
 import (
 	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 
 	"homecloud-file-service/config"
 	"homecloud-file-service/internal/interfaces"
 	"homecloud-file-service/internal/logger"
+	"homecloud-file-service/internal/models"
 	pb "homecloud-file-service/internal/transport/grpc/protos"
 
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -49,13 +50,15 @@ func LoggerInterceptor(log *logger.Logger) grpc.UnaryServerInterceptor {
 type FileServiceServer struct {
 	pb.UnimplementedFileServiceServer
 	storageService interfaces.StorageService
+	fileService    interfaces.FileService
 	config         *config.Config
 }
 
 // NewFileServiceServer создает новый экземпляр gRPC сервера
-func NewFileServiceServer(storageService interfaces.StorageService, cfg *config.Config) *FileServiceServer {
+func NewFileServiceServer(storageService interfaces.StorageService, fileService interfaces.FileService, cfg *config.Config) *FileServiceServer {
 	return &FileServiceServer{
 		storageService: storageService,
+		fileService:    fileService,
 		config:         cfg,
 	}
 }
@@ -64,42 +67,58 @@ func NewFileServiceServer(storageService interfaces.StorageService, cfg *config.
 func (s *FileServiceServer) CreateUserDirectory(ctx context.Context, req *pb.CreateUserDirectoryRequest) (*pb.CreateUserDirectoryResponse, error) {
 	lg := logger.GetLoggerFromCtx(ctx)
 	lg.Info(ctx, "CreateUserDirectory called", zap.String("userID", req.UserId))
+	
 	// Валидация входных данных
 	if req.UserId == "" {
 		lg.Error(ctx, "user_id is required")
 		return nil, status.Errorf(codes.InvalidArgument, "user_id is required")
 	}
 
+	// Парсим userID
+	userID, err := uuid.Parse(req.UserId)
+	if err != nil {
+		lg.Error(ctx, "Invalid user_id format", zap.Error(err))
+		return nil, status.Errorf(codes.InvalidArgument, "invalid user_id format")
+	}
+
 	// Формируем путь к директории пользователя
 	userDirPath := filepath.Join(s.config.Storage.BasePath, s.config.Storage.UserDirName, req.UserId)
 
-	// Создаем директорию пользователя
-	if err := os.MkdirAll(userDirPath, 0755); err != nil {
-		lg.Error(ctx, "Failed to create user directory", zap.Error(err))
-		return &pb.CreateUserDirectoryResponse{
-			Success:       false,
-			Message:       fmt.Sprintf("Failed to create user directory: %v", err),
-			DirectoryPath: "",
-		}, nil
-	}
-
-	// Создаем стандартные поддиректории
+	// Создаем стандартные поддиректории и записи в БД
 	standardDirs := []string{"documents", "photos", "videos", "music", "downloads"}
-	for _, dir := range standardDirs {
-		subDirPath := filepath.Join(userDirPath, dir)
-		if err := os.MkdirAll(subDirPath, 0755); err != nil {
-			lg.Error(ctx, "Failed to create subdirectory", zap.String("dir", dir), zap.Error(err))
+	
+	for _, dirName := range standardDirs {
+		// Создаем запись в базе данных через FileService
+		createReq := &models.CreateFileRequest{
+			Name:     dirName,
+			ParentID: nil, // Корневая папка пользователя
+			IsFolder: true,
+			MimeType: "application/x-directory",
+			Size:     0,
+		}
+
+		_, err := s.fileService.CreateFile(ctx, createReq, userID)
+		if err != nil {
+			lg.Error(ctx, "Failed to create folder record in database", 
+				zap.String("dir", dirName), 
+				zap.Error(err))
 			return &pb.CreateUserDirectoryResponse{
 				Success:       false,
-				Message:       fmt.Sprintf("Failed to create subdirectory %s: %v", dir, err),
+				Message:       fmt.Sprintf("Failed to create folder record in database for %s: %v", dirName, err),
 				DirectoryPath: "",
 			}, nil
 		}
+
+		lg.Info(ctx, "Created folder record in database", zap.String("dir", dirName))
 	}
-	lg.Info(ctx, "User directory created successfully", zap.String("userID", req.UserId), zap.String("path", userDirPath))
+
+	lg.Info(ctx, "User directory and database records created successfully", 
+		zap.String("userID", req.UserId), 
+		zap.String("path", userDirPath))
+	
 	return &pb.CreateUserDirectoryResponse{
 		Success:       true,
-		Message:       "User directory created successfully",
+		Message:       "User directory and database records created successfully",
 		DirectoryPath: userDirPath,
 	}, nil
 }

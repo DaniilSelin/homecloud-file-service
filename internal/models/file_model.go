@@ -81,6 +81,7 @@ type UpdateFileRequest struct {
 type FileListRequest struct {
 	ParentID  *uuid.UUID `json:"parent_id,omitempty"`
 	OwnerID   uuid.UUID  `json:"owner_id"`
+	Path      string     `json:"path,omitempty"`
 	IsTrashed *bool      `json:"is_trashed,omitempty"`
 	Starred   *bool      `json:"starred,omitempty"`
 	Limit     int        `json:"limit,omitempty"`
@@ -127,4 +128,18 @@ type ResumableSession struct {
 	IsCompleted bool       `json:"is_completed" db:"is_completed"`
 	CreatedAt   time.Time  `json:"created_at" db:"created_at"`
 	UpdatedAt   time.Time  `json:"updated_at" db:"updated_at"`
+}
+
+// ResumableDownloadSession представляет сессию для возобновляемого скачивания
+type ResumableDownloadSession struct {
+	ID          string     `json:"id"`
+	FileID      uuid.UUID  `json:"file_id"`
+	UserID      uuid.UUID  `json:"user_id"`
+	FileName    string     `json:"file_name"`
+	FilePath    string     `json:"file_path"`
+	Size        int64      `json:"size"`
+	Checksum    string     `json:"checksum"`
+	MimeType    string     `json:"mime_type"`
+	ExpiresAt   time.Time  `json:"expires_at"`
+	CreatedAt   time.Time  `json:"created_at"`
 }

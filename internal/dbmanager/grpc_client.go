@@ -72,7 +72,6 @@ func (c *GRPCDBClient) Close() error {
 // convertFileToProto конвертирует модель File в proto сообщение
 func convertFileToProto(file *models.File) *pb.File {
 	protoFile := &pb.File{
-		Id:          file.ID.String(),
 		OwnerId:     file.OwnerID.String(),
 		Name:        file.Name,
 		MimeType:    file.MimeType,
@@ -85,6 +84,11 @@ func convertFileToProto(file *models.File) *pb.File {
 		Version:     file.Version,
 		CreatedAt:   timestamppb.New(file.CreatedAt),
 		UpdatedAt:   timestamppb.New(file.UpdatedAt),
+	}
+
+	// Добавляем ID только если он не пустой (не нулевой UUID)
+	if file.ID != uuid.Nil {
+		protoFile.Id = file.ID.String()
 	}
 
 	// Опциональные поля
@@ -210,37 +214,88 @@ func convertProtoToFile(protoFile *pb.File) (*models.File, error) {
 // File operations
 func (c *GRPCDBClient) CreateFile(ctx context.Context, file *models.File) error {
 	lg := logger.GetLoggerFromCtx(ctx)
-	lg.Info(ctx, "Creating file in dbmanager", zap.String("fileID", file.ID.String()))
+	lg.Info(ctx, "CreateFile (dbmanager) called",
+		zap.String("fileName", file.Name),
+		zap.String("ownerID", file.OwnerID.String()),
+		zap.Bool("isFolder", file.IsFolder),
+		zap.Int64("size", file.Size))
 
+	// Конвертируем в proto
 	protoFile := convertFileToProto(file)
-	_, err := c.client.CreateFile(ctx, protoFile)
+
+	lg.Debug(ctx, "Sending CreateFile request to dbmanager",
+		zap.String("fileName", file.Name))
+
+	// Вызываем gRPC метод
+	resp, err := c.client.CreateFile(ctx, protoFile)
 	if err != nil {
-		lg.Error(ctx, "Failed to create file in dbmanager", zap.Error(err))
-		return fmt.Errorf("failed to create file: %w", err)
+		lg.Error(ctx, "CreateFile gRPC call failed",
+			zap.Error(err),
+			zap.String("fileName", file.Name))
+		return fmt.Errorf("gRPC CreateFile failed: %w", err)
 	}
 
-	lg.Info(ctx, "File created successfully in dbmanager", zap.String("fileID", file.ID.String()))
+	// Обновляем ID файла из ответа DBManager
+	if resp.Id != "" {
+		fileID, err := uuid.Parse(resp.Id)
+		if err != nil {
+			lg.Error(ctx, "Failed to parse file ID from response",
+				zap.Error(err),
+				zap.String("responseID", resp.Id))
+			return fmt.Errorf("invalid file ID in response: %w", err)
+		}
+		file.ID = fileID
+		lg.Info(ctx, "File ID updated from DBManager response",
+			zap.String("fileID", file.ID.String()),
+			zap.String("fileName", file.Name))
+	}
+
+	lg.Info(ctx, "CreateFile gRPC call successful",
+		zap.String("fileID", file.ID.String()),
+		zap.String("fileName", file.Name),
+		zap.String("responseID", resp.Id))
+
 	return nil
 }
 
 func (c *GRPCDBClient) GetFileByID(ctx context.Context, id uuid.UUID) (*models.File, error) {
 	lg := logger.GetLoggerFromCtx(ctx)
-	lg.Info(ctx, "Getting file from dbmanager", zap.String("fileID", id.String()))
+	lg.Info(ctx, "GetFileByID (dbmanager) called", zap.String("fileID", id.String()))
 
-	req := &pb.FileID{Id: id.String()}
+	// Создаем запрос
+	req := &pb.FileID{
+		Id: id.String(),
+	}
+
+	lg.Debug(ctx, "Sending GetFileByID request to dbmanager", zap.String("fileID", id.String()))
+
+	// Вызываем gRPC метод
 	protoFile, err := c.client.GetFileByID(ctx, req)
 	if err != nil {
-		lg.Error(ctx, "Failed to get file from dbmanager", zap.Error(err))
-		return nil, fmt.Errorf("failed to get file: %w", err)
+		lg.Error(ctx, "GetFileByID gRPC call failed",
+			zap.Error(err),
+			zap.String("fileID", id.String()))
+		return nil, fmt.Errorf("gRPC GetFileByID failed: %w", err)
 	}
 
+	lg.Debug(ctx, "GetFileByID gRPC response received", zap.String("fileID", id.String()))
+
+	// Конвертируем ответ
 	file, err := convertProtoToFile(protoFile)
 	if err != nil {
-		lg.Error(ctx, "Failed to convert proto file", zap.Error(err))
-		return nil, fmt.Errorf("failed to convert file: %w", err)
+		lg.Error(ctx, "Failed to convert proto response to file",
+			zap.Error(err),
+			zap.String("fileID", id.String()))
+		return nil, fmt.Errorf("failed to convert response: %w", err)
 	}
 
-	lg.Info(ctx, "File retrieved successfully from dbmanager", zap.String("fileID", id.String()))
+	lg.Info(ctx, "GetFileByID successful",
+		zap.String("fileID", id.String()),
+		zap.String("fileName", file.Name),
+		zap.String("ownerID", file.OwnerID.String()),
+		zap.Bool("isFolder", file.IsFolder),
+		zap.Int64("size", file.Size))
+
 	return file, nil
 }
 
@@ -306,80 +361,136 @@ func (c *GRPCDBClient) RestoreFile(ctx context.Context, id uuid.UUID) error {
 
 func (c *GRPCDBClient) ListFiles(ctx context.Context, req *models.FileListRequest) (*models.FileListResponse, error) {
 	lg := logger.GetLoggerFromCtx(ctx)
-	lg.Info(ctx, "Listing files from dbmanager", zap.String("ownerID", req.OwnerID.String()))
+	lg.Info(ctx, "ListFiles (dbmanager) called",
+		zap.String("ownerID", req.OwnerID.String()),
+		zap.Int("limit", req.Limit),
+		zap.Int("offset", req.Offset),
+		zap.String("orderBy", req.OrderBy),
+		zap.String("orderDir", req.OrderDir))
+
+	// Конвертируем запрос
+	parentIDStr := ""
+	if req.ParentID != nil {
+		parentIDStr = req.ParentID.String()
+	}
 
 	protoReq := &pb.ListFilesRequest{
-		OwnerId:   req.OwnerID.String(),
-		IsTrashed: req.IsTrashed != nil && *req.IsTrashed,
-		Starred:   req.Starred != nil && *req.Starred,
-		Limit:     int32(req.Limit),
-		Offset:    int32(req.Offset),
-		OrderBy:   req.OrderBy,
-		OrderDir:  req.OrderDir,
+		OwnerId:  req.OwnerID.String(),
+		ParentId: parentIDStr,
+		Limit:    int32(req.Limit),
+		Offset:   int32(req.Offset),
+		OrderBy:  req.OrderBy,
+		OrderDir: req.OrderDir,
 	}
 
-	if req.ParentID != nil {
-		protoReq.ParentId = req.ParentID.String()
+	if req.IsTrashed != nil {
+		protoReq.IsTrashed = *req.IsTrashed
+	}
+	if req.Starred != nil {
+		protoReq.Starred = *req.Starred
 	}
 
-	protoResp, err := c.client.ListFiles(ctx, protoReq)
+	lg.Debug(ctx, "Sending ListFiles request to dbmanager",
+		zap.String("ownerID", req.OwnerID.String()),
+		zap.String("parentID", parentIDStr))
+
+	// Вызываем gRPC метод
+	resp, err := c.client.ListFiles(ctx, protoReq)
 	if err != nil {
-		lg.Error(ctx, "Failed to list files from dbmanager", zap.Error(err))
-		return nil, fmt.Errorf("failed to list files: %w", err)
+		lg.Error(ctx, "ListFiles gRPC call failed",
+			zap.Error(err),
+			zap.String("ownerID", req.OwnerID.String()))
+		return nil, fmt.Errorf("gRPC ListFiles failed: %w", err)
 	}
+
+	lg.Debug(ctx, "ListFiles gRPC response received",
+		zap.String("ownerID", req.OwnerID.String()),
+		zap.Int("filesCount", len(resp.Files)))
 
 	// Конвертируем ответ
-	files := make([]models.File, len(protoResp.Files))
-	for i, protoFile := range protoResp.Files {
+	files := make([]models.File, 0, len(resp.Files))
+	for i, protoFile := range resp.Files {
 		file, err := convertProtoToFile(protoFile)
 		if err != nil {
-			lg.Error(ctx, "Failed to convert proto file", zap.Error(err))
-			return nil, fmt.Errorf("failed to convert file: %w", err)
+			lg.Error(ctx, "Failed to convert proto file",
+				zap.Error(err),
+				zap.Int("index", i),
+				zap.String("fileID", protoFile.Id))
+			continue
 		}
-		files[i] = *file
+		files = append(files, *file)
 	}
 
 	response := &models.FileListResponse{
 		Files:  files,
-		Total:  protoResp.Total,
-		Limit:  int(protoResp.Limit),
-		Offset: int(protoResp.Offset),
+		Total:  resp.Total,
+		Limit:  req.Limit,
+		Offset: req.Offset,
 	}
 
-	lg.Info(ctx, "Files listed successfully from dbmanager", zap.Int("count", len(files)))
+	lg.Info(ctx, "ListFiles successful",
+		zap.String("ownerID", req.OwnerID.String()),
+		zap.Int("filesCount", len(files)),
+		zap.Int64("total", resp.Total))
+
 	return response, nil
 }
 
 func (c *GRPCDBClient) ListFilesByParent(ctx context.Context, ownerID uuid.UUID, parentID *uuid.UUID) ([]models.File, error) {
 	lg := logger.GetLoggerFromCtx(ctx)
-	lg.Info(ctx, "Listing files by parent from dbmanager", zap.String("ownerID", ownerID.String()))
-
-	req := &pb.ListFilesByParentRequest{
-		OwnerId: ownerID.String(),
-	}
-
+	parentIDStr := "nil"
 	if parentID != nil {
-		req.ParentId = parentID.String()
+		parentIDStr = parentID.String()
 	}
 
-	protoResp, err := c.client.ListFilesByParent(ctx, req)
-	if err != nil {
-		lg.Error(ctx, "Failed to list files by parent from dbmanager", zap.Error(err))
-		return nil, fmt.Errorf("failed to list files by parent: %w", err)
+	lg.Info(ctx, "ListFilesByParent (dbmanager) called",
+		zap.String("ownerID", ownerID.String()),
+		zap.String("parentID", parentIDStr))
+
+	// Создаем запрос
+	req := &pb.ListFilesByParentRequest{
+		OwnerId:  ownerID.String(),
+		ParentId: parentIDStr,
 	}
+
+	lg.Debug(ctx, "Sending ListFilesByParent request to dbmanager",
+		zap.String("ownerID", ownerID.String()),
+		zap.String("parentID", parentIDStr))
+
+	// Вызываем gRPC метод
+	resp, err := c.client.ListFilesByParent(ctx, req)
+	if err != nil {
+		lg.Error(ctx, "ListFilesByParent gRPC call failed",
+			zap.Error(err),
+			zap.String("ownerID", ownerID.String()),
+			zap.String("parentID", parentIDStr))
+		return nil, fmt.Errorf("gRPC ListFilesByParent failed: %w", err)
+	}
+
+	lg.Debug(ctx, "ListFilesByParent gRPC response received",
+		zap.String("ownerID", ownerID.String()),
+		zap.String("parentID", parentIDStr),
+		zap.Int("filesCount", len(resp.Files)))
 
 	// Конвертируем ответ
-	files := make([]models.File, len(protoResp.Files))
-	for i, protoFile := range protoResp.Files {
+	files := make([]models.File, 0, len(resp.Files))
+	for i, protoFile := range resp.Files {
 		file, err := convertProtoToFile(protoFile)
 		if err != nil {
-			lg.Error(ctx, "Failed to convert proto file", zap.Error(err))
-			return nil, fmt.Errorf("failed to convert file: %w", err)
+			lg.Error(ctx, "Failed to convert proto file",
+				zap.Error(err),
+				zap.Int("index", i),
+				zap.String("fileID", protoFile.Id))
+			continue
 		}
-		files[i] = *file
+		files = append(files, *file)
 	}
 
-	lg.Info(ctx, "Files by parent listed successfully from dbmanager", zap.Int("count", len(files)))
+	lg.Info(ctx, "ListFilesByParent successful",
+		zap.String("ownerID", ownerID.String()),
+		zap.String("parentID", parentIDStr),
+		zap.Int("filesCount", len(files)))
+
 	return files, nil
 }
 
@@ -400,47 +511,96 @@ func (c *GRPCDBClient) UpdateLastViewed(ctx context.Context, id uuid.UUID) error
 
 func (c *GRPCDBClient) CheckPermission(ctx context.Context, fileID uuid.UUID, userID uuid.UUID, requiredRole string) (bool, error) {
 	lg := logger.GetLoggerFromCtx(ctx)
-	lg.Info(ctx, "Checking permission in dbmanager", zap.String("fileID", fileID.String()), zap.String("userID", userID.String()))
+	lg.Info(ctx, "CheckPermission (dbmanager) called",
+		zap.String("fileID", fileID.String()),
+		zap.String("userID", userID.String()),
+		zap.String("requiredRole", requiredRole))
 
+	// Создаем запрос
 	req := &pb.CheckPermissionRequest{
 		FileId:       fileID.String(),
 		UserId:       userID.String(),
 		RequiredRole: requiredRole,
 	}
 
+	lg.Debug(ctx, "Sending CheckPermission request to dbmanager",
+		zap.String("fileID", fileID.String()),
+		zap.String("userID", userID.String()),
+		zap.String("requiredRole", requiredRole))
+
+	// Вызываем gRPC метод
 	resp, err := c.client.CheckPermission(ctx, req)
 	if err != nil {
-		lg.Error(ctx, "Failed to check permission in dbmanager", zap.Error(err))
-		return false, fmt.Errorf("failed to check permission: %w", err)
+		lg.Error(ctx, "CheckPermission gRPC call failed",
+			zap.Error(err),
+			zap.String("fileID", fileID.String()),
+			zap.String("userID", userID.String()),
+			zap.String("requiredRole", requiredRole))
+		return false, fmt.Errorf("gRPC CheckPermission failed: %w", err)
 	}
 
-	lg.Info(ctx, "Permission checked successfully in dbmanager", zap.Bool("hasPermission", resp.HasPermission))
+	lg.Debug(ctx, "CheckPermission gRPC response received",
+		zap.String("fileID", fileID.String()),
+		zap.Bool("hasPermission", resp.HasPermission))
+
+	lg.Info(ctx, "CheckPermission successful",
+		zap.String("fileID", fileID.String()),
+		zap.String("userID", userID.String()),
+		zap.String("requiredRole", requiredRole),
+		zap.Bool("hasPermission", resp.HasPermission))
+
 	return resp.HasPermission, nil
 }
 
 // Дополнительные методы для работы с файлами
 func (c *GRPCDBClient) GetFileByPath(ctx context.Context, ownerID uuid.UUID, path string) (*models.File, error) {
 	lg := logger.GetLoggerFromCtx(ctx)
-	lg.Info(ctx, "Getting file by path from dbmanager", zap.String("ownerID", ownerID.String()), zap.String("path", path))
+	lg.Info(ctx, "GetFileByPath (dbmanager) called",
+		zap.String("ownerID", ownerID.String()),
+		zap.String("path", path))
 
+	// Создаем запрос
 	req := &pb.GetFileByPathRequest{
 		OwnerId: ownerID.String(),
 		Path:    path,
 	}
 
+	lg.Debug(ctx, "Sending GetFileByPath request to dbmanager",
+		zap.String("ownerID", ownerID.String()),
+		zap.String("path", path))
+
+	// Вызываем gRPC метод
 	protoFile, err := c.client.GetFileByPath(ctx, req)
 	if err != nil {
-		lg.Error(ctx, "Failed to get file by path from dbmanager", zap.Error(err))
-		return nil, fmt.Errorf("failed to get file by path: %w", err)
+		lg.Error(ctx, "GetFileByPath gRPC call failed",
+			zap.Error(err),
+			zap.String("ownerID", ownerID.String()),
+			zap.String("path", path))
+		return nil, fmt.Errorf("gRPC GetFileByPath failed: %w", err)
 	}
 
+	lg.Debug(ctx, "GetFileByPath gRPC response received",
+		zap.String("ownerID", ownerID.String()),
+		zap.String("path", path))
+
+	// Конвертируем ответ
 	file, err := convertProtoToFile(protoFile)
 	if err != nil {
-		lg.Error(ctx, "Failed to convert proto file", zap.Error(err))
-		return nil, fmt.Errorf("failed to convert file: %w", err)
+		lg.Error(ctx, "Failed to convert proto response to file",
+			zap.Error(err),
+			zap.String("ownerID", ownerID.String()),
+			zap.String("path", path))
+		return nil, fmt.Errorf("failed to convert response: %w", err)
 	}
 
-	lg.Info(ctx, "File by path retrieved successfully from dbmanager", zap.String("path", path))
+	lg.Info(ctx, "GetFileByPath successful",
+		zap.String("ownerID", ownerID.String()),
+		zap.String("path", path),
+		zap.String("fileID", file.ID.String()),
+		zap.String("fileName", file.Name),
+		zap.Bool("isFolder", file.IsFolder),
+		zap.Int64("size", file.Size))
+
 	return file, nil
 }
 

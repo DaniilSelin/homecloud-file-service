@@ -161,11 +161,16 @@ Authorization: Bearer <token>
 }
 ```
 
-#### Удаление файла
+#### Удаление файла (Рекурсивное жесткое удаление)
 ```http
 DELETE /files/{id}
 Authorization: Bearer <token>
 ```
+
+**Важно:** Этот метод выполняет **рекурсивное жесткое удаление** файла или папки. Это означает:
+- Для файлов: удаляет физический файл с диска и запись из базы данных
+- Для папок: рекурсивно удаляет все содержимое папки (файлы и подпапки) с диска и из базы данных
+- Операция необратима - удаленные данные невозможно восстановить
 
 **Ответ:**
 ```json
@@ -194,10 +199,10 @@ Authorization: Bearer <token>
 ```
 
 **Параметры запроса:**
-- `parent_id` (optional) - ID родительской папки
-- `is_trashed` (optional) - Показать только удаленные файлы
-- `starred` (optional) - Показать только избранные файлы
-- `limit` (optional) - Количество файлов на странице (по умолчанию 20)
+- `parent_id` (optional) - ID родительской папки для фильтрации файлов
+- `is_trashed` (optional) - Показать только удаленные файлы (true/false)
+- `starred` (optional) - Показать только избранные файлы (true/false)
+- `limit` (optional) - Количество файлов на странице (по умолчанию 20, максимум 100)
 - `offset` (optional) - Смещение для пагинации (по умолчанию 0)
 - `order_by` (optional) - Поле для сортировки (name, size, created_at, updated_at)
 - `order_dir` (optional) - Направление сортировки (asc, desc)
@@ -210,7 +215,11 @@ Authorization: Bearer <token>
       "id": "uuid",
       "name": "document.pdf",
       "size": 1024,
-      "is_folder": false
+      "is_folder": false,
+      "mime_type": "application/pdf",
+      "starred": false,
+      "created_at": "2023-01-01T00:00:00Z",
+      "updated_at": "2023-01-01T00:00:00Z"
     }
   ],
   "total": 100,
@@ -261,10 +270,14 @@ GET /download?path=documents/report.pdf
 Authorization: Bearer <token>
 ```
 
+**Параметры запроса:**
+- `path` (required) - Путь к файлу для скачивания
+
 **Ответ:** Бинарные данные файла с заголовками:
 ```
 Content-Type: application/octet-stream
 Content-Disposition: attachment; filename="report.pdf"
+Content-Length: 1024
 ```
 
 #### Загрузка по ID файла
@@ -292,6 +305,7 @@ Authorization: Bearer <token>
 ```
 Content-Type: application/octet-stream
 Content-Disposition: attachment; filename="document.pdf"
+Content-Length: 1024
 ```
 
 #### Получение содержимого файла
@@ -985,6 +999,12 @@ curl -X GET "http://localhost:8082/api/v1/files/{file-id}/download" \
   -o downloaded_document.pdf
 ```
 
+5. **Удаление файла (рекурсивное жесткое удаление):**
+```bash
+curl -X DELETE "http://localhost:8082/api/v1/files/{file-id}" \
+  -H "Authorization: Bearer TOKEN"
+```
+
 ### Работа с папками
 
 1. **Создание папки:**
@@ -1010,6 +1030,12 @@ curl -X POST "http://localhost:8082/api/v1/files/{file-id}/move" \
 3. **Просмотр содержимого папки:**
 ```bash
 curl -X GET "http://localhost:8082/api/v1/folders/browse?path=Documents/Reports" \
+  -H "Authorization: Bearer TOKEN"
+```
+
+4. **Удаление папки (рекурсивно удалит все содержимое):**
+```bash
+curl -X DELETE "http://localhost:8082/api/v1/files/{folder-id}" \
   -H "Authorization: Bearer TOKEN"
 ```
 
@@ -1062,7 +1088,20 @@ curl -X GET "http://localhost:8082/api/v1/files?parent_id={folder-id}" \
   -H "Authorization: Bearer TOKEN"
 ```
 
+4. **Получение удаленных файлов:**
+```bash
+curl -X GET "http://localhost:8082/api/v1/files/trashed" \
+  -H "Authorization: Bearer TOKEN"
+```
+
 ## Особенности реализации
+
+### Рекурсивное жесткое удаление
+При удалении файла или папки через `DELETE /files/{id}` выполняется **рекурсивное жесткое удаление**:
+- **Для файлов**: удаляется физический файл с диска и запись из базы данных
+- **Для папок**: рекурсивно удаляется все содержимое папки (файлы и подпапки) с диска и из базы данных
+- **Необратимость**: удаленные данные невозможно восстановить
+- **Безопасность**: проверяются права доступа пользователя перед удалением
 
 ### Автоматическое создание папок
 При загрузке файла по пути система автоматически создает все необходимые папки в иерархии. Например, при загрузке файла в путь `Documents/Reports/2024/january.pdf` будут созданы папки:
@@ -1078,3 +1117,16 @@ curl -X GET "http://localhost:8082/api/v1/files?parent_id={folder-id}" \
 
 ### Версионирование
 При обновлении файлов автоматически создаются ревизии, что позволяет отслеживать изменения и восстанавливать предыдущие версии.
+
+### Пагинация и сортировка
+Метод `GET /files` поддерживает пагинацию и сортировку для эффективной работы с большими объемами данных:
+- `limit` - количество файлов на странице (по умолчанию 20, максимум 100)
+- `offset` - смещение для пагинации
+- `order_by` - поле для сортировки (name, size, created_at, updated_at)
+- `order_dir` - направление сортировки (asc, desc)
+
+### Фильтрация
+Поддерживаются различные фильтры для списка файлов:
+- `parent_id` - фильтрация по родительской папке
+- `is_trashed` - показ только удаленных файлов
+- `starred` - показ только избранных файлов

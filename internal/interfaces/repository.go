@@ -18,6 +18,7 @@ type FileRepository interface {
 	DeleteFile(ctx context.Context, id uuid.UUID) error
 	SoftDeleteFile(ctx context.Context, id uuid.UUID) error
 	RestoreFile(ctx context.Context, id uuid.UUID) error
+	CreateFileFromFS(ctx context.Context, file *models.File) error
 
 	// Операции со списками файлов
 	ListFiles(ctx context.Context, req *models.FileListRequest) (*models.FileListResponse, error)

@@ -36,15 +36,26 @@ func NewFileRepository(cfg *config.Config) (interfaces.FileRepository, error) {
 // Основные операции с файлами
 func (r *fileRepository) CreateFile(ctx context.Context, file *models.File) error {
 	lg := logger.GetLoggerFromCtx(ctx)
-	lg.Info(ctx, "CreateFile (repo) called", zap.String("fileID", file.ID.String()))
+	lg.Info(ctx, "CreateFile (repo) called",
+		zap.String("fileID", file.ID.String()),
+		zap.String("fileName", file.Name),
+		zap.String("ownerID", file.OwnerID.String()),
+		zap.Bool("isFolder", file.IsFolder),
+		zap.Int64("size", file.Size))
 
 	err := r.dbClient.CreateFile(ctx, file)
 	if err != nil {
-		lg.Error(ctx, "Failed to create file", zap.Error(err))
+		lg.Error(ctx, "Failed to create file",
+			zap.Error(err),
+			zap.String("fileID", file.ID.String()),
+			zap.String("fileName", file.Name))
 		return fmt.Errorf("failed to create file: %w", err)
 	}
 
-	lg.Info(ctx, "File created successfully", zap.String("fileID", file.ID.String()))
+	lg.Info(ctx, "File created successfully",
+		zap.String("fileID", file.ID.String()),
+		zap.String("fileName", file.Name),
+		zap.String("storagePath", file.StoragePath))
 	return nil
 }
 
@@ -54,39 +65,78 @@ func (r *fileRepository) GetFileByID(ctx context.Context, id uuid.UUID) (*models
 
 	file, err := r.dbClient.GetFileByID(ctx, id)
 	if err != nil {
-		lg.Error(ctx, "Failed to get file by ID", zap.Error(err))
+		lg.Error(ctx, "Failed to get file by ID",
+			zap.Error(err),
+			zap.String("fileID", id.String()))
 		return nil, fmt.Errorf("failed to get file: %w", err)
 	}
 
-	lg.Info(ctx, "File retrieved successfully", zap.String("fileID", id.String()))
+	if file == nil {
+		lg.Info(ctx, "File not found", zap.String("fileID", id.String()))
+		return nil, nil
+	}
+
+	lg.Info(ctx, "File retrieved successfully",
+		zap.String("fileID", id.String()),
+		zap.String("fileName", file.Name),
+		zap.String("ownerID", file.OwnerID.String()),
+		zap.Bool("isFolder", file.IsFolder),
+		zap.Int64("size", file.Size),
+		zap.String("storagePath", file.StoragePath))
 	return file, nil
 }
 
 func (r *fileRepository) GetFileByPath(ctx context.Context, ownerID uuid.UUID, path string) (*models.File, error) {
 	lg := logger.GetLoggerFromCtx(ctx)
-	lg.Info(ctx, "GetFileByPath (repo) called", zap.String("ownerID", ownerID.String()), zap.String("path", path))
+	lg.Info(ctx, "GetFileByPath (repo) called",
+		zap.String("ownerID", ownerID.String()),
+		zap.String("path", path))
 
 	file, err := r.dbClient.GetFileByPath(ctx, ownerID, path)
 	if err != nil {
-		lg.Error(ctx, "Failed to get file by path", zap.Error(err))
+		lg.Error(ctx, "Failed to get file by path",
+			zap.Error(err),
+			zap.String("ownerID", ownerID.String()),
+			zap.String("path", path))
 		return nil, fmt.Errorf("failed to get file by path: %w", err)
 	}
 
-	lg.Info(ctx, "File by path retrieved successfully", zap.String("path", path))
+	if file == nil {
+		lg.Info(ctx, "File not found by path",
+			zap.String("ownerID", ownerID.String()),
+			zap.String("path", path))
+		return nil, nil
+	}
+
+	lg.Info(ctx, "File by path retrieved successfully",
+		zap.String("path", path),
+		zap.String("fileID", file.ID.String()),
+		zap.String("fileName", file.Name),
+		zap.Bool("isFolder", file.IsFolder),
+		zap.Int64("size", file.Size))
 	return file, nil
 }
 
 func (r *fileRepository) UpdateFile(ctx context.Context, file *models.File) error {
 	lg := logger.GetLoggerFromCtx(ctx)
-	lg.Info(ctx, "UpdateFile (repo) called", zap.String("fileID", file.ID.String()))
+	lg.Info(ctx, "UpdateFile (repo) called",
+		zap.String("fileID", file.ID.String()),
+		zap.String("fileName", file.Name),
+		zap.Bool("isFolder", file.IsFolder),
+		zap.Int64("size", file.Size))
 
 	err := r.dbClient.UpdateFile(ctx, file)
 	if err != nil {
-		lg.Error(ctx, "Failed to update file", zap.Error(err))
+		lg.Error(ctx, "Failed to update file",
+			zap.Error(err),
+			zap.String("fileID", file.ID.String()),
+			zap.String("fileName", file.Name))
 		return fmt.Errorf("failed to update file: %w", err)
 	}
 
-	lg.Info(ctx, "File updated successfully", zap.String("fileID", file.ID.String()))
+	lg.Info(ctx, "File updated successfully",
+		zap.String("fileID", file.ID.String()),
+		zap.String("fileName", file.Name))
 	return nil
 }
 
@@ -135,29 +185,74 @@ func (r *fileRepository) RestoreFile(ctx context.Context, id uuid.UUID) error {
 // Операции со списками файлов
 func (r *fileRepository) ListFiles(ctx context.Context, req *models.FileListRequest) (*models.FileListResponse, error) {
 	lg := logger.GetLoggerFromCtx(ctx)
-	lg.Info(ctx, "ListFiles (repo) called", zap.String("ownerID", req.OwnerID.String()))
+	lg.Info(ctx, "ListFiles (repo) called",
+		zap.String("ownerID", req.OwnerID.String()),
+		zap.Int("limit", req.Limit),
+		zap.Int("offset", req.Offset),
+		zap.String("orderBy", req.OrderBy),
+		zap.String("orderDir", req.OrderDir))
 
 	response, err := r.dbClient.ListFiles(ctx, req)
 	if err != nil {
-		lg.Error(ctx, "Failed to list files", zap.Error(err))
+		lg.Error(ctx, "Failed to list files",
+			zap.Error(err),
+			zap.String("ownerID", req.OwnerID.String()))
 		return nil, fmt.Errorf("failed to list files: %w", err)
 	}
 
-	lg.Info(ctx, "Files listed successfully", zap.Int("count", len(response.Files)))
+	lg.Info(ctx, "Files listed successfully",
+		zap.Int("count", len(response.Files)),
+		zap.Int64("total", response.Total),
+		zap.String("ownerID", req.OwnerID.String()))
+
+	// Логируем детали каждого файла для отладки
+	for i, file := range response.Files {
+		lg.Debug(ctx, "File in list",
+			zap.Int("index", i),
+			zap.String("fileID", file.ID.String()),
+			zap.String("fileName", file.Name),
+			zap.Bool("isFolder", file.IsFolder),
+			zap.Int64("size", file.Size))
+	}
+
 	return response, nil
 }
 
 func (r *fileRepository) ListFilesByParent(ctx context.Context, ownerID uuid.UUID, parentID *uuid.UUID) ([]models.File, error) {
 	lg := logger.GetLoggerFromCtx(ctx)
-	lg.Info(ctx, "ListFilesByParent (repo) called", zap.String("ownerID", ownerID.String()))
+	parentIDStr := "nil"
+	if parentID != nil {
+		parentIDStr = parentID.String()
+	}
+
+	lg.Info(ctx, "ListFilesByParent (repo) called",
+		zap.String("ownerID", ownerID.String()),
+		zap.String("parentID", parentIDStr))
 
 	files, err := r.dbClient.ListFilesByParent(ctx, ownerID, parentID)
 	if err != nil {
-		lg.Error(ctx, "Failed to list files by parent", zap.Error(err))
+		lg.Error(ctx, "Failed to list files by parent",
+			zap.Error(err),
+			zap.String("ownerID", ownerID.String()),
+			zap.String("parentID", parentIDStr))
 		return nil, fmt.Errorf("failed to list files by parent: %w", err)
 	}
 
-	lg.Info(ctx, "Files by parent listed successfully", zap.Int("count", len(files)))
+	lg.Info(ctx, "Files by parent listed successfully",
+		zap.Int("count", len(files)),
+		zap.String("ownerID", ownerID.String()),
+		zap.String("parentID", parentIDStr))
+
+	// Логируем детали каждого файла для отладки
+	for i, file := range files {
+		lg.Debug(ctx, "File in parent list",
+			zap.Int("index", i),
+			zap.String("fileID", file.ID.String()),
+			zap.String("fileName", file.Name),
+			zap.Bool("isFolder", file.IsFolder),
+			zap.Int64("size", file.Size))
+	}
+
 	return files, nil
 }
 
@@ -305,15 +400,27 @@ func (r *fileRepository) DeletePermission(ctx context.Context, id uuid.UUID) err
 
 func (r *fileRepository) CheckPermission(ctx context.Context, fileID uuid.UUID, userID uuid.UUID, requiredRole string) (bool, error) {
 	lg := logger.GetLoggerFromCtx(ctx)
-	lg.Info(ctx, "CheckPermission (repo) called", zap.String("fileID", fileID.String()), zap.String("userID", userID.String()))
+	lg.Info(ctx, "CheckPermission (repo) called",
+		zap.String("fileID", fileID.String()),
+		zap.String("userID", userID.String()),
+		zap.String("requiredRole", requiredRole))
 
 	hasPermission, err := r.dbClient.CheckPermission(ctx, fileID, userID, requiredRole)
 	if err != nil {
-		lg.Error(ctx, "Failed to check permission", zap.Error(err))
+		lg.Error(ctx, "Failed to check permission",
+			zap.Error(err),
+			zap.String("fileID", fileID.String()),
+			zap.String("userID", userID.String()),
+			zap.String("requiredRole", requiredRole))
 		return false, fmt.Errorf("failed to check permission: %w", err)
 	}
 
-	lg.Info(ctx, "Permission checked successfully", zap.Bool("hasPermission", hasPermission))
+	lg.Info(ctx, "Permission check completed",
+		zap.Bool("hasPermission", hasPermission),
+		zap.String("fileID", fileID.String()),
+		zap.String("userID", userID.String()),
+		zap.String("requiredRole", requiredRole))
+
 	return hasPermission, nil
 }
 
@@ -501,4 +608,9 @@ func (r *fileRepository) CalculateFileChecksums(ctx context.Context, fileID uuid
 
 	lg.Info(ctx, "File checksums calculated successfully in dbmanager", zap.Int("checksumCount", len(checksums)))
 	return checksums, nil
+}
+
+// CreateFileFromFS добавляет файл в БД по данным из файловой системы
+func (r *fileRepository) CreateFileFromFS(ctx context.Context, file *models.File) error {
+	return r.CreateFile(ctx, file)
 }

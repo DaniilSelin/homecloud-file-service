@@ -16,12 +16,19 @@ type FileService interface {
 	GetFile(ctx context.Context, fileID uuid.UUID, userID uuid.UUID) (*models.File, error)
 	UpdateFile(ctx context.Context, fileID uuid.UUID, req *models.UpdateFileRequest, userID uuid.UUID) (*models.File, error)
 	DeleteFile(ctx context.Context, fileID uuid.UUID, userID uuid.UUID) error
+	DeleteFileRecursive(ctx context.Context, fileID uuid.UUID, userID uuid.UUID) error
 	RestoreFile(ctx context.Context, fileID uuid.UUID, userID uuid.UUID) error
 
 	// Операции с контентом файлов
 	UploadFile(ctx context.Context, fileID uuid.UUID, content io.Reader, userID uuid.UUID) error
 	DownloadFile(ctx context.Context, fileID uuid.UUID, userID uuid.UUID) (io.ReadCloser, string, error)
 	GetFileContent(ctx context.Context, fileID uuid.UUID, userID uuid.UUID) ([]byte, error)
+
+	// Возобновляемое скачивание
+	InitResumableDownload(ctx context.Context, fileID uuid.UUID, userID uuid.UUID) (*models.ResumableDownloadSession, error)
+	GetResumableDownloadSession(ctx context.Context, sessionID string) (*models.ResumableDownloadSession, error)
+	DownloadFileChunk(ctx context.Context, sessionID string, start, end uint64) (io.ReadCloser, error)
+	DeleteResumableDownloadSession(ctx context.Context, sessionID string) error
 
 	// Операции со списками файлов
 	ListFiles(ctx context.Context, req *models.FileListRequest) (*models.FileListResponse, error)

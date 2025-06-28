@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"strings"
+	"sync"
 	"time"
 
 	"homecloud-file-service/config"
@@ -18,17 +20,106 @@ import (
 	"go.uber.org/zap"
 )
 
+// MIME типы по расширениям
+var mimeTypes = map[string]string{
+	// Текстовые файлы
+	".txt":  "text/plain",
+	".md":   "text/markdown",
+	".html": "text/html",
+	".css":  "text/css",
+	".js":   "application/javascript",
+	".json": "application/json",
+	".xml":  "application/xml",
+	".csv":  "text/csv",
+	".log":  "text/plain",
+
+	// Изображения
+	".jpg":  "image/jpeg",
+	".jpeg": "image/jpeg",
+	".png":  "image/png",
+	".gif":  "image/gif",
+	".bmp":  "image/bmp",
+	".svg":  "image/svg+xml",
+	".webp": "image/webp",
+	".ico":  "image/x-icon",
+
+	// Документы
+	".pdf":  "application/pdf",
+	".doc":  "application/msword",
+	".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+	".xls":  "application/vnd.ms-excel",
+	".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+	".ppt":  "application/vnd.ms-powerpoint",
+	".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+
+	// Архивы
+	".zip": "application/zip",
+	".rar": "application/vnd.rar",
+	".7z":  "application/x-7z-compressed",
+	".tar": "application/x-tar",
+	".gz":  "application/gzip",
+
+	// Аудио
+	".mp3":  "audio/mpeg",
+	".wav":  "audio/wav",
+	".ogg":  "audio/ogg",
+	".flac": "audio/flac",
+	".aac":  "audio/aac",
+
+	// Видео
+	".mp4":  "video/mp4",
+	".avi":  "video/x-msvideo",
+	".mkv":  "video/x-matroska",
+	".mov":  "video/quicktime",
+	".wmv":  "video/x-ms-wmv",
+	".flv":  "video/x-flv",
+	".webm": "video/webm",
+
+	// Код
+	".py":   "text/x-python",
+	".java": "text/x-java-source",
+	".cpp":  "text/x-c++src",
+	".c":    "text/x-csrc",
+	".go":   "text/x-go",
+	".php":  "text/x-php",
+	".rb":   "text/x-ruby",
+	".sh":   "application/x-sh",
+	".bat":  "application/x-msdos-program",
+
+	// Другие
+	".sql":  "application/sql",
+	".yaml": "application/x-yaml",
+	".yml":  "application/x-yaml",
+	".toml": "application/toml",
+	".ini":  "text/plain",
+	".conf": "text/plain",
+	".cfg":  "text/plain",
+}
+
+// getMimeTypeByExtension определяет MIME тип по расширению файла
+func getMimeTypeByExtension(filename string) string {
+	ext := strings.ToLower(filepath.Ext(filename))
+	if mimeType, exists := mimeTypes[ext]; exists {
+		return mimeType
+	}
+	return "application/octet-stream"
+}
+
 type fileService struct {
 	fileRepo    interfaces.FileRepository
 	storageRepo interfaces.StorageRepository
 	cfg         *config.Config
+	// Добавляем map для хранения сессий в памяти
+	resumableSessions map[string]*models.ResumableDownloadSession
+	sessionMutex      sync.RWMutex
 }
 
 func NewFileService(fileRepo interfaces.FileRepository, storageRepo interfaces.StorageRepository, cfg *config.Config) interfaces.FileService {
 	return &fileService{
-		fileRepo:    fileRepo,
-		storageRepo: storageRepo,
-		cfg:         cfg,
+		fileRepo:          fileRepo,
+		storageRepo:       storageRepo,
+		cfg:               cfg,
+		resumableSessions: make(map[string]*models.ResumableDownloadSession),
 	}
 }
 
@@ -37,18 +128,14 @@ func (s *fileService) CreateFile(ctx context.Context, req *models.CreateFileRequ
 	lg := logger.GetLoggerFromCtx(ctx)
 	lg.Info(ctx, "CreateFile called", zap.Any("req", req), zap.String("ownerID", ownerID.String()))
 
-	// Генерируем ID для файла
-	fileID := uuid.New()
-
 	// Определяем MIME тип
 	mimeType := req.MimeType
 	if mimeType == "" && !req.IsFolder {
-		mimeType = "application/octet-stream"
+		mimeType = getMimeTypeByExtension(req.Name)
 	}
 
-	// Создаем объект файла
+	// Создаем объект файла (без ID - он будет сгенерирован БД)
 	file := &models.File{
-		ID:         fileID,
 		OwnerID:    ownerID,
 		ParentID:   req.ParentID,
 		Name:       req.Name,
@@ -69,40 +156,117 @@ func (s *fileService) CreateFile(ctx context.Context, req *models.CreateFileRequ
 		}
 	}
 
-	// Генерируем путь для хранения
-	storagePath := s.generateStoragePath(ownerID, fileID, req.Name)
-	file.StoragePath = storagePath
+	// Сохраняем файл в БД и получаем сгенерированный ID
+	if err := s.fileRepo.CreateFile(ctx, file); err != nil {
+		lg.Error(ctx, "Failed to create file in database", zap.Error(err))
+		return nil, fmt.Errorf("failed to create file in database: %w", err)
+	}
 
-	// Если есть контент, сохраняем его
+	// Теперь у нас есть ID из БД, обновляем storage_path с правильным ID
+	relativeStoragePath := ""
+	absoluteStoragePath := ""
+	if req.ParentID != nil {
+		parent, err := s.fileRepo.GetFileByID(ctx, *req.ParentID)
+		if err == nil && parent != nil && parent.IsFolder {
+			relativeStoragePath = filepath.Join(parent.StoragePath[len(filepath.Join(s.cfg.Storage.BasePath, s.cfg.Storage.UserDirName))+1:], fmt.Sprintf("%s_%s", file.ID.String(), req.Name))
+			absoluteStoragePath = filepath.Join(parent.StoragePath, fmt.Sprintf("%s_%s", file.ID.String(), req.Name))
+		}
+	}
+	if relativeStoragePath == "" || absoluteStoragePath == "" {
+		relativeStoragePath = filepath.Join(ownerID.String(), fmt.Sprintf("%s_%s", file.ID.String(), req.Name))
+		absoluteStoragePath = filepath.Join(s.cfg.Storage.BasePath, s.cfg.Storage.UserDirName, relativeStoragePath)
+	}
+	file.StoragePath = absoluteStoragePath
+
+	// Обновляем storage_path в БД
+	if err := s.fileRepo.UpdateFile(ctx, file); err != nil {
+		lg.Error(ctx, "Failed to update storage path", zap.Error(err))
+		// Не возвращаем ошибку, так как файл уже создан
+	}
+
+	// Если это папка, создаем директорию в файловой системе с относительным storage_path
+	if req.IsFolder {
+		if err := s.storageRepo.CreateDirectory(ctx, relativeStoragePath); err != nil {
+			lg.Error(ctx, "Failed to create directory", zap.Error(err))
+			return nil, fmt.Errorf("failed to create directory: %w", err)
+		}
+		lg.Info(ctx, "Directory created successfully", zap.String("path", relativeStoragePath))
+	}
+
+	// Если есть контент, сохраняем его (тоже относительный путь)
 	if len(req.Content) > 0 && !req.IsFolder {
-		if err := s.storageRepo.SaveFile(ctx, storagePath, req.Content); err != nil {
+		if err := s.storageRepo.SaveFile(ctx, relativeStoragePath, req.Content); err != nil {
 			lg.Error(ctx, "Failed to save file content", zap.Error(err))
 			return nil, fmt.Errorf("failed to save file content: %w", err)
 		}
 
 		// Вычисляем контрольные суммы
-		md5Checksum, err := s.storageRepo.CalculateChecksum(ctx, storagePath, "md5")
+		md5Checksum, err := s.storageRepo.CalculateChecksum(ctx, relativeStoragePath, "md5")
 		if err != nil {
 			lg.Error(ctx, "Failed to calculate MD5 checksum", zap.Error(err))
 		} else {
 			file.MD5Checksum = &md5Checksum
 		}
 
-		sha256Checksum, err := s.storageRepo.CalculateChecksum(ctx, storagePath, "sha256")
+		sha256Checksum, err := s.storageRepo.CalculateChecksum(ctx, relativeStoragePath, "sha256")
 		if err != nil {
 			lg.Error(ctx, "Failed to calculate SHA256 checksum", zap.Error(err))
 		} else {
 			file.SHA256Checksum = &sha256Checksum
 		}
+
+		// Обновляем контрольные суммы в БД
+		if err := s.fileRepo.UpdateFile(ctx, file); err != nil {
+			lg.Error(ctx, "Failed to update checksums", zap.Error(err))
+			// Не возвращаем ошибку, так как файл уже создан
+		}
 	}
 
-	// Сохраняем файл в БД
-	if err := s.fileRepo.CreateFile(ctx, file); err != nil {
-		lg.Error(ctx, "Failed to create file in database", zap.Error(err))
-		return nil, fmt.Errorf("failed to create file in database: %w", err)
+	// Создаем права доступа для владельца файла
+	ownerPermission := &models.FilePermission{
+		ID:          uuid.New(),
+		FileID:      file.ID,
+		GranteeID:   &ownerID,
+		GranteeType: models.GranteeTypeUser,
+		Role:        models.RoleOwner,
+		AllowShare:  true,
 	}
 
-	lg.Info(ctx, "File created successfully", zap.String("fileID", fileID.String()), zap.String("name", req.Name))
+	if err := s.fileRepo.CreatePermission(ctx, ownerPermission); err != nil {
+		lg.Error(ctx, "Failed to create owner permission", zap.Error(err))
+		// Не возвращаем ошибку, так как файл уже создан
+	} else {
+		lg.Info(ctx, "Owner permission created successfully", zap.String("fileID", file.ID.String()))
+	}
+
+	// Создаем ревизию файла (если это не папка)
+	if !req.IsFolder {
+		revision := &models.FileRevision{
+			ID:          uuid.New(),
+			FileID:      file.ID,
+			RevisionID:  1,
+			Size:        file.Size,
+			StoragePath: file.StoragePath,
+			UserID:      &ownerID,
+		}
+
+		// Копируем MIME тип и контрольные суммы
+		if file.MimeType != "" {
+			revision.MimeType = &file.MimeType
+		}
+		if file.MD5Checksum != nil {
+			revision.MD5Checksum = file.MD5Checksum
+		}
+
+		if err := s.fileRepo.CreateRevision(ctx, revision); err != nil {
+			lg.Error(ctx, "Failed to create file revision", zap.Error(err))
+			// Не возвращаем ошибку, так как файл уже создан
+		} else {
+			lg.Info(ctx, "File revision created successfully", zap.String("fileID", file.ID.String()), zap.Int64("revisionID", revision.RevisionID))
+		}
+	}
+
+	lg.Info(ctx, "File created successfully", zap.String("fileID", file.ID.String()), zap.String("name", req.Name))
 	return file, nil
 }
 
@@ -112,9 +276,49 @@ func (s *fileService) GetFile(ctx context.Context, fileID uuid.UUID, userID uuid
 
 	// Получаем файл из БД
 	file, err := s.fileRepo.GetFileByID(ctx, fileID)
-	if err != nil {
-		lg.Error(ctx, "Failed to get file from database", zap.Error(err))
-		return nil, fmt.Errorf("failed to get file: %w", err)
+	if err != nil || file == nil {
+		lg.Info(ctx, "File not found in DB, trying to find in filesystem", zap.String("fileID", fileID.String()), zap.Error(err))
+
+		// Рекурсивно ищем файл по ID во всех подпапках пользователя
+		foundPath, foundName, err := s.findFileRecursively(ctx, userID, fileID)
+		if err != nil {
+			lg.Error(ctx, "Failed to find file recursively", zap.Error(err))
+			return nil, fmt.Errorf("file not found")
+		}
+
+		if foundPath == "" {
+			return nil, fmt.Errorf("file not found")
+		}
+
+		// Получаем инфу о файле из ФС
+		info, err := s.storageRepo.GetFileInfo(ctx, foundPath)
+		if err != nil {
+			lg.Error(ctx, "Failed to get file info from FS", zap.Error(err))
+			return nil, fmt.Errorf("file not found")
+		}
+
+		// Собираем структуру файла
+		parts := strings.SplitN(foundName, "_", 2)
+		name := parts[1]
+		mimeType := getMimeTypeByExtension(name)
+		file = &models.File{
+			ID:          fileID,
+			OwnerID:     userID,
+			Name:        name,
+			Size:        info.Size,
+			IsFolder:    info.IsDirectory,
+			MimeType:    mimeType,
+			StoragePath: foundPath,
+			CreatedAt:   time.Unix(info.ModifiedAt, 0),
+			UpdatedAt:   time.Unix(info.ModifiedAt, 0),
+		}
+
+		// Добавляем в БД
+		if err := s.fileRepo.CreateFileFromFS(ctx, file); err != nil {
+			lg.Error(ctx, "Failed to add file to DB from FS", zap.Error(err))
+			// Не возвращаем ошибку, а просто логируем
+		}
+		lg.Info(ctx, "File restored from FS and added to DB", zap.String("fileID", fileID.String()))
 	}
 
 	// Проверяем права доступа
@@ -228,6 +432,18 @@ func (s *fileService) DeleteFile(ctx context.Context, fileID uuid.UUID, userID u
 	lg := logger.GetLoggerFromCtx(ctx)
 	lg.Info(ctx, "DeleteFile called", zap.String("fileID", fileID.String()), zap.String("userID", userID.String()))
 
+	// Получаем файл из БД
+	file, err := s.fileRepo.GetFileByID(ctx, fileID)
+	if err != nil {
+		lg.Error(ctx, "Failed to get file from database", zap.Error(err))
+		return fmt.Errorf("failed to get file: %w", err)
+	}
+
+	if file == nil {
+		lg.Error(ctx, "File not found", zap.String("fileID", fileID.String()))
+		return fmt.Errorf("file not found")
+	}
+
 	// Проверяем права доступа (нужны права на запись)
 	hasAccess, err := s.fileRepo.CheckPermission(ctx, fileID, userID, models.RoleWriter)
 	if err != nil {
@@ -247,6 +463,105 @@ func (s *fileService) DeleteFile(ctx context.Context, fileID uuid.UUID, userID u
 	}
 
 	lg.Info(ctx, "File deleted successfully", zap.String("fileID", fileID.String()))
+	return nil
+}
+
+func (s *fileService) DeleteFileRecursive(ctx context.Context, fileID uuid.UUID, userID uuid.UUID) error {
+	lg := logger.GetLoggerFromCtx(ctx)
+	lg.Info(ctx, "DeleteFileRecursive called", zap.String("fileID", fileID.String()), zap.String("userID", userID.String()))
+
+	// Получаем файл из БД
+	file, err := s.fileRepo.GetFileByID(ctx, fileID)
+	if err != nil {
+		lg.Error(ctx, "Failed to get file from database", zap.Error(err))
+		return fmt.Errorf("failed to get file: %w", err)
+	}
+
+	if file == nil {
+		lg.Error(ctx, "File not found", zap.String("fileID", fileID.String()))
+		return fmt.Errorf("file not found")
+	}
+
+	// Проверяем права доступа (нужны права на запись)
+	hasAccess, err := s.fileRepo.CheckPermission(ctx, fileID, userID, models.RoleWriter)
+	if err != nil {
+		lg.Error(ctx, "Failed to check permission", zap.Error(err))
+		return fmt.Errorf("failed to check permission: %w", err)
+	}
+
+	if !hasAccess {
+		lg.Error(ctx, "Access denied", zap.String("fileID", fileID.String()), zap.String("userID", userID.String()))
+		return fmt.Errorf("access denied")
+	}
+
+	// Рекурсивно удаляем файл/папку
+	if err := s.deleteFileRecursiveHelper(ctx, file, userID); err != nil {
+		lg.Error(ctx, "Failed to delete file recursively", zap.Error(err))
+		return fmt.Errorf("failed to delete file recursively: %w", err)
+	}
+
+	lg.Info(ctx, "File deleted recursively successfully", zap.String("fileID", fileID.String()))
+	return nil
+}
+
+// deleteFileRecursiveHelper рекурсивно удаляет файл или папку и все их содержимое
+func (s *fileService) deleteFileRecursiveHelper(ctx context.Context, file *models.File, userID uuid.UUID) error {
+	lg := logger.GetLoggerFromCtx(ctx)
+
+	// Если это папка, сначала удаляем все содержимое
+	if file.IsFolder {
+		lg.Debug(ctx, "Deleting folder contents", zap.String("folderID", file.ID.String()), zap.String("folderName", file.Name))
+		
+		// Получаем все файлы в папке
+		children, err := s.fileRepo.ListFilesByParent(ctx, file.OwnerID, &file.ID)
+		if err != nil {
+			lg.Error(ctx, "Failed to list folder contents", zap.Error(err))
+			return fmt.Errorf("failed to list folder contents: %w", err)
+		}
+
+		// Рекурсивно удаляем каждый файл/папку
+		for _, child := range children {
+			if err := s.deleteFileRecursiveHelper(ctx, &child, userID); err != nil {
+				lg.Error(ctx, "Failed to delete child file", zap.Error(err), zap.String("childID", child.ID.String()))
+				return fmt.Errorf("failed to delete child file: %w", err)
+			}
+		}
+	}
+
+	// Удаляем физический файл/папку из хранилища
+	relativePath := file.StoragePath
+	if strings.HasPrefix(relativePath, s.cfg.Storage.BasePath) {
+		relativePath = strings.TrimPrefix(relativePath, s.cfg.Storage.BasePath)
+		relativePath = strings.TrimPrefix(relativePath, "/")
+		relativePath = strings.TrimPrefix(relativePath, s.cfg.Storage.UserDirName)
+		relativePath = strings.TrimPrefix(relativePath, "/")
+	}
+
+	if relativePath != "" {
+		if file.IsFolder {
+			if err := s.storageRepo.DeleteDirectory(ctx, relativePath); err != nil {
+				lg.Error(ctx, "Failed to delete directory from storage", zap.Error(err), zap.String("path", relativePath))
+				// Не возвращаем ошибку, продолжаем удаление из БД
+			} else {
+				lg.Debug(ctx, "Directory deleted from storage", zap.String("path", relativePath))
+			}
+		} else {
+			if err := s.storageRepo.DeleteFile(ctx, relativePath); err != nil {
+				lg.Error(ctx, "Failed to delete file from storage", zap.Error(err), zap.String("path", relativePath))
+				// Не возвращаем ошибку, продолжаем удаление из БД
+			} else {
+				lg.Debug(ctx, "File deleted from storage", zap.String("path", relativePath))
+			}
+		}
+	}
+
+	// Удаляем запись из БД
+	if err := s.fileRepo.DeleteFile(ctx, file.ID); err != nil {
+		lg.Error(ctx, "Failed to delete file from database", zap.Error(err))
+		return fmt.Errorf("failed to delete file from database: %w", err)
+	}
+
+	lg.Debug(ctx, "File deleted from database", zap.String("fileID", file.ID.String()), zap.String("fileName", file.Name))
 	return nil
 }
 
@@ -445,45 +760,76 @@ func (s *fileService) GetFileContent(ctx context.Context, fileID uuid.UUID, user
 // Операции со списками файлов
 func (s *fileService) ListFiles(ctx context.Context, req *models.FileListRequest) (*models.FileListResponse, error) {
 	lg := logger.GetLoggerFromCtx(ctx)
-	userDir := s.getUserDirPath(req.OwnerID)
-
-	// Получаем список файлов из файловой системы
-	fileNames, err := s.storageRepo.ListDirectory(ctx, userDir)
-	if err != nil {
-		if lg != nil {
-			lg.Error(ctx, "Failed to list files from storage", zap.Error(err))
-		}
-		return nil, fmt.Errorf("failed to list files: %w", err)
-	}
+	lg.Info(ctx, "ListFiles called", zap.Any("req", req))
 
 	var files []models.File
-	for _, fileName := range fileNames {
-		filePath := fmt.Sprintf("%s/%s", userDir, fileName)
-		fileInfo, err := s.storageRepo.GetFileInfo(ctx, filePath)
+
+	// Если указан путь, находим папку по пути и получаем её содержимое
+	if req.Path != "" {
+		// Получаем файл (папку) по пути
+		folder, err := s.GetFileDetails(ctx, req.OwnerID, req.Path)
 		if err != nil {
-			continue // Пропускаем файл, если не можем получить информацию
+			if err.Error() == "file not found" {
+				// Если папка не найдена, возвращаем пустой список
+				return &models.FileListResponse{
+					Files: []models.File{},
+					Total: 0,
+				}, nil
+			}
+			lg.Error(ctx, "Failed to get folder by path", zap.Error(err))
+			return nil, fmt.Errorf("failed to get folder by path: %w", err)
 		}
-		file := models.File{
-			Name:        fileName,
-			Size:        fileInfo.Size,
-			IsFolder:    fileInfo.IsDirectory,
-			OwnerID:     req.OwnerID,
-			StoragePath: filePath,
-			CreatedAt:   time.Now(),
-			UpdatedAt:   time.Unix(fileInfo.ModifiedAt, 0),
+
+		// Проверяем, что это папка
+		if !folder.IsFolder {
+			lg.Error(ctx, "Specified path is not a folder", zap.String("path", req.Path))
+			return nil, fmt.Errorf("specified path is not a folder")
 		}
-		if fileInfo.IsDirectory {
-			file.MimeType = "application/x-directory"
-		} else {
-			file.MimeType = "application/octet-stream"
+
+		// Получаем содержимое папки
+		files, err = s.ListFolderContents(ctx, &folder.ID, req.OwnerID)
+		if err != nil {
+			lg.Error(ctx, "Failed to list folder contents", zap.Error(err))
+			return nil, fmt.Errorf("failed to list folder contents: %w", err)
 		}
-		files = append(files, file)
+
+		// Применяем фильтры из запроса
+		filteredFiles := make([]models.File, 0)
+		for _, file := range files {
+			if req.IsTrashed != nil && file.IsTrashed != *req.IsTrashed {
+				continue
+			}
+			if req.Starred != nil && file.Starred != *req.Starred {
+				continue
+			}
+			filteredFiles = append(filteredFiles, file)
+		}
+		files = filteredFiles
+	} else {
+		// Если путь не указан, используем стандартный метод с parent_id
+		response, err := s.fileRepo.ListFiles(ctx, req)
+		if err != nil {
+			lg.Error(ctx, "Failed to list files from database", zap.Error(err))
+			return nil, fmt.Errorf("failed to list files: %w", err)
+		}
+		files = response.Files
+	}
+
+	// Применяем пагинацию
+	total := int64(len(files))
+	if req.Offset > 0 && req.Offset < len(files) {
+		files = files[req.Offset:]
+	}
+	if req.Limit > 0 && req.Limit < len(files) {
+		files = files[:req.Limit]
 	}
 
 	response := &models.FileListResponse{
 		Files: files,
-		Total: int64(len(files)),
+		Total: total,
 	}
+
+	lg.Info(ctx, "Files listed successfully", zap.Int("count", len(files)), zap.Int64("total", total))
 	return response, nil
 }
 
@@ -1225,8 +1571,13 @@ func (s *fileService) CalculateFileChecksums(ctx context.Context, fileID uuid.UU
 }
 
 // generateStoragePath генерирует путь для хранения файла
-func (s *fileService) generateStoragePath(ownerID uuid.UUID, fileID uuid.UUID, fileName string) string {
-	// Формат: storage/users/{ownerID}/{fileID}_{fileName}
+func (s *fileService) generateStoragePath(ownerID uuid.UUID, fileID uuid.UUID, fileName string, parentID *uuid.UUID) string {
+	if parentID != nil {
+		parent, err := s.fileRepo.GetFileByID(context.Background(), *parentID)
+		if err == nil && parent != nil && parent.IsFolder {
+			return filepath.Join(parent.StoragePath, fmt.Sprintf("%s_%s", fileID.String(), fileName))
+		}
+	}
 	return filepath.Join(s.cfg.Storage.BasePath, s.cfg.Storage.UserDirName, ownerID.String(), fmt.Sprintf("%s_%s", fileID.String(), fileName))
 }
 
@@ -1259,4 +1610,207 @@ func (s *fileService) GetFileDetails(ctx context.Context, userID uuid.UUID, file
 // getUserDirPath возвращает путь к директории пользователя
 func (s *fileService) getUserDirPath(userID uuid.UUID) string {
 	return userID.String()
+}
+
+func (s *fileService) findFileRecursively(ctx context.Context, userID uuid.UUID, fileID uuid.UUID) (string, string, error) {
+	// Начинаем поиск с корневой папки пользователя
+	userDir := s.getUserDirPath(userID)
+	return s.findFileRecursivelyHelper(ctx, userID, fileID, userDir)
+}
+
+func (s *fileService) findFileRecursivelyHelper(ctx context.Context, userID uuid.UUID, fileID uuid.UUID, currentPath string) (string, string, error) {
+	lg := logger.GetLoggerFromCtx(ctx)
+
+	// Получаем список файлов в текущей папке
+	fileNames, err := s.storageRepo.ListDirectory(ctx, currentPath)
+	if err != nil {
+		lg.Error(ctx, "Failed to list directory", zap.String("path", currentPath), zap.Error(err))
+		return "", "", fmt.Errorf("failed to list directory: %w", err)
+	}
+
+	// Сначала проверяем файлы в текущей папке
+	for _, fileName := range fileNames {
+		parts := strings.SplitN(fileName, "_", 2)
+		if len(parts) == 2 && parts[0] == fileID.String() {
+			fullPath := filepath.Join(currentPath, fileName)
+			lg.Info(ctx, "File found", zap.String("path", fullPath), zap.String("name", fileName))
+			return fullPath, fileName, nil
+		}
+	}
+
+	// Затем рекурсивно ищем в подпапках
+	for _, fileName := range fileNames {
+		// Проверяем, является ли это папкой (у папок нет расширения или они заканчиваются на /)
+		ext := filepath.Ext(fileName)
+		if ext == "" || strings.HasSuffix(fileName, "/") {
+			subDirPath := filepath.Join(currentPath, fileName)
+			foundPath, foundName, err := s.findFileRecursivelyHelper(ctx, userID, fileID, subDirPath)
+			if err == nil && foundPath != "" {
+				return foundPath, foundName, nil
+			}
+		}
+	}
+
+	return "", "", fmt.Errorf("file not found")
+}
+
+// Возобновляемое скачивание
+func (s *fileService) InitResumableDownload(ctx context.Context, fileID uuid.UUID, userID uuid.UUID) (*models.ResumableDownloadSession, error) {
+	lg := logger.GetLoggerFromCtx(ctx)
+	lg.Info(ctx, "InitResumableDownload called", zap.String("fileID", fileID.String()), zap.String("userID", userID.String()))
+
+	// Получаем файл из БД
+	file, err := s.fileRepo.GetFileByID(ctx, fileID)
+	if err != nil {
+		lg.Error(ctx, "Failed to get file from database", zap.Error(err))
+		return nil, fmt.Errorf("failed to get file: %w", err)
+	}
+
+	if file == nil {
+		lg.Error(ctx, "File not found", zap.String("fileID", fileID.String()))
+		return nil, fmt.Errorf("file not found")
+	}
+
+	// Проверяем права доступа (нужны права на чтение)
+	hasAccess, err := s.fileRepo.CheckPermission(ctx, fileID, userID, models.RoleReader)
+	if err != nil {
+		lg.Error(ctx, "Failed to check permission", zap.Error(err))
+		return nil, fmt.Errorf("failed to check permission: %w", err)
+	}
+
+	if !hasAccess {
+		lg.Error(ctx, "Access denied", zap.String("fileID", fileID.String()), zap.String("userID", userID.String()))
+		return nil, fmt.Errorf("access denied")
+	}
+
+	// Проверяем, что это не папка
+	if file.IsFolder {
+		lg.Error(ctx, "Cannot download folder", zap.String("fileID", fileID.String()))
+		return nil, fmt.Errorf("cannot download folder")
+	}
+
+	// Вычисляем контрольную сумму файла
+	relativePath := file.StoragePath
+	if strings.HasPrefix(relativePath, s.cfg.Storage.BasePath) {
+		relativePath = strings.TrimPrefix(relativePath, s.cfg.Storage.BasePath)
+		relativePath = strings.TrimPrefix(relativePath, "/")
+		relativePath = strings.TrimPrefix(relativePath, s.cfg.Storage.UserDirName)
+		relativePath = strings.TrimPrefix(relativePath, "/")
+	}
+
+	checksum, err := s.storageRepo.CalculateChecksum(ctx, relativePath, "sha256")
+	if err != nil {
+		lg.Error(ctx, "Failed to calculate checksum", zap.Error(err))
+		return nil, fmt.Errorf("failed to calculate checksum: %w", err)
+	}
+
+	// Генерируем уникальный ID сессии
+	sessionID := uuid.New().String()
+
+	// Создаем сессию
+	session := &models.ResumableDownloadSession{
+		ID:        sessionID,
+		FileID:    fileID,
+		UserID:    userID,
+		FileName:  file.Name,
+		FilePath:  relativePath,
+		Size:      file.Size,
+		Checksum:  checksum,
+		MimeType:  file.MimeType,
+		ExpiresAt: time.Now().Add(24 * time.Hour), // Сессия действительна 24 часа
+		CreatedAt: time.Now(),
+	}
+
+	// Сохраняем сессию в памяти (в реальном приложении лучше использовать Redis или БД)
+	s.saveResumableDownloadSession(session)
+
+	lg.Info(ctx, "Resumable download session created", zap.String("sessionID", sessionID))
+	return session, nil
+}
+
+func (s *fileService) GetResumableDownloadSession(ctx context.Context, sessionID string) (*models.ResumableDownloadSession, error) {
+	lg := logger.GetLoggerFromCtx(ctx)
+	lg.Info(ctx, "GetResumableDownloadSession called", zap.String("sessionID", sessionID))
+
+	session := s.getResumableDownloadSession(sessionID)
+	if session == nil {
+		lg.Error(ctx, "Session not found", zap.String("sessionID", sessionID))
+		return nil, fmt.Errorf("session not found")
+	}
+
+	// Проверяем, не истекла ли сессия
+	if time.Now().After(session.ExpiresAt) {
+		lg.Error(ctx, "Session expired", zap.String("sessionID", sessionID))
+		s.deleteResumableDownloadSession(sessionID)
+		return nil, fmt.Errorf("session expired")
+	}
+
+	return session, nil
+}
+
+func (s *fileService) DownloadFileChunk(ctx context.Context, sessionID string, start, end uint64) (io.ReadCloser, error) {
+	lg := logger.GetLoggerFromCtx(ctx)
+	lg.Info(ctx, "DownloadFileChunk called", zap.String("sessionID", sessionID), zap.Uint64("start", start), zap.Uint64("end", end))
+
+	session := s.getResumableDownloadSession(sessionID)
+	if session == nil {
+		lg.Error(ctx, "Session not found", zap.String("sessionID", sessionID))
+		return nil, fmt.Errorf("session not found")
+	}
+
+	// Проверяем, не истекла ли сессия
+	if time.Now().After(session.ExpiresAt) {
+		lg.Error(ctx, "Session expired", zap.String("sessionID", sessionID))
+		s.deleteResumableDownloadSession(sessionID)
+		return nil, fmt.Errorf("session expired")
+	}
+
+	// Проверяем валидность диапазона
+	if start >= uint64(session.Size) || end >= uint64(session.Size) || start > end {
+		lg.Error(ctx, "Invalid range", zap.Uint64("start", start), zap.Uint64("end", end), zap.Int64("fileSize", session.Size))
+		return nil, fmt.Errorf("invalid range")
+	}
+
+	// Получаем файл из хранилища
+	content, err := s.storageRepo.GetFile(ctx, session.FilePath)
+	if err != nil {
+		lg.Error(ctx, "Failed to get file from storage", zap.Error(err))
+		return nil, fmt.Errorf("failed to get file: %w", err)
+	}
+
+	// Создаем reader для нужного диапазона
+	chunkSize := end - start + 1
+	if start+chunkSize > uint64(len(content)) {
+		chunkSize = uint64(len(content)) - start
+	}
+
+	chunk := content[start : start+chunkSize]
+	return io.NopCloser(bytes.NewReader(chunk)), nil
+}
+
+func (s *fileService) DeleteResumableDownloadSession(ctx context.Context, sessionID string) error {
+	lg := logger.GetLoggerFromCtx(ctx)
+	lg.Info(ctx, "DeleteResumableDownloadSession called", zap.String("sessionID", sessionID))
+
+	s.deleteResumableDownloadSession(sessionID)
+	return nil
+}
+
+// Вспомогательные методы для работы с сессиями в памяти
+func (s *fileService) saveResumableDownloadSession(session *models.ResumableDownloadSession) {
+	s.sessionMutex.Lock()
+	defer s.sessionMutex.Unlock()
+	s.resumableSessions[session.ID] = session
+}
+
+func (s *fileService) getResumableDownloadSession(sessionID string) *models.ResumableDownloadSession {
+	s.sessionMutex.RLock()
+	defer s.sessionMutex.RUnlock()
+	return s.resumableSessions[sessionID]
+}
+
+func (s *fileService) deleteResumableDownloadSession(sessionID string) {
+	s.sessionMutex.Lock()
+	defer s.sessionMutex.Unlock()
+	delete(s.resumableSessions, sessionID)
 }
