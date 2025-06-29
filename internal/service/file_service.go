@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -97,7 +98,7 @@ var mimeTypes = map[string]string{
 }
 
 // getMimeTypeByExtension определяет MIME тип по расширению файла
-func getMimeTypeByExtension(filename string) string {
+func GetMimeTypeByExtension(filename string) string {
 	ext := strings.ToLower(filepath.Ext(filename))
 	if mimeType, exists := mimeTypes[ext]; exists {
 		return mimeType
@@ -131,7 +132,7 @@ func (s *fileService) CreateFile(ctx context.Context, req *models.CreateFileRequ
 	// Определяем MIME тип
 	mimeType := req.MimeType
 	if mimeType == "" && !req.IsFolder {
-		mimeType = getMimeTypeByExtension(req.Name)
+		mimeType = GetMimeTypeByExtension(req.Name)
 	}
 
 	// Создаем объект файла (без ID - он будет сгенерирован БД)
@@ -300,7 +301,7 @@ func (s *fileService) GetFile(ctx context.Context, fileID uuid.UUID, userID uuid
 		// Собираем структуру файла
 		parts := strings.SplitN(foundName, "_", 2)
 		name := parts[1]
-		mimeType := getMimeTypeByExtension(name)
+		mimeType := GetMimeTypeByExtension(name)
 		file = &models.File{
 			ID:          fileID,
 			OwnerID:     userID,
@@ -694,8 +695,14 @@ func (s *fileService) DownloadFile(ctx context.Context, fileID uuid.UUID, userID
 		return nil, "", fmt.Errorf("cannot download folder content")
 	}
 
-	// Получаем контент из хранилища
-	content, err := s.storageRepo.GetFile(ctx, file.StoragePath)
+	// Получаем относительный путь для storageRepo
+	relPath := file.StoragePath
+	userDirPrefix := filepath.Join(s.cfg.Storage.BasePath, s.cfg.Storage.UserDirName) + string(os.PathSeparator)
+	if strings.HasPrefix(relPath, userDirPrefix) {
+		relPath = strings.TrimPrefix(relPath, userDirPrefix)
+	}
+
+	content, err := s.storageRepo.GetFile(ctx, relPath)
 	if err != nil {
 		lg.Error(ctx, "Failed to get file content from storage", zap.Error(err))
 		return nil, "", fmt.Errorf("failed to get file content: %w", err)

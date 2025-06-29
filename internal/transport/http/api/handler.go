@@ -2,16 +2,20 @@ package api
 
 import (
 	"bytes"
+	"mime"
 	"context"
+	_ "crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
+	"archive/zip"
 
 	"homecloud-file-service/internal/auth"
 	"homecloud-file-service/internal/interfaces"
@@ -23,12 +27,15 @@ import (
 	"go.uber.org/zap"
 	_ "go.uber.org/zap"
 	"github.com/gorilla/handlers"
+	"crypto/sha256"
+	"github.com/go-playground/validator/v10"
 )
 
 type Handler struct {
 	fileService    interfaces.FileService
 	storageService interfaces.StorageService
 	authClient     *auth.GRPCAuthClient
+	validator      *validator.Validate
 }
 
 func NewHandler(fileService interfaces.FileService, storageService interfaces.StorageService, authClient *auth.GRPCAuthClient) *Handler {
@@ -36,11 +43,13 @@ func NewHandler(fileService interfaces.FileService, storageService interfaces.St
 		fileService:    fileService,
 		storageService: storageService,
 		authClient:     authClient,
+		validator:      validator.New(),
 	}
 }
 
 // SetupRoutes настраивает маршруты API
 func SetupRoutes(handler *Handler, log *logger.Logger) http.Handler {
+	// Инициализация маршрутизатора
 	router := mux.NewRouter()
 
 	// Health check endpoint (без аутентификации)
@@ -55,17 +64,30 @@ func SetupRoutes(handler *Handler, log *logger.Logger) http.Handler {
 	api.Use(auth.LoggerMiddleware(log))
 	api.Use(auth.AuthMiddleware(handler.authClient))
 
+	// Регистрируем обработчики для возобновляемой загрузки
+	api.HandleFunc("/files/upload/resumable/{sessionID}", handler.ResumableUpload).Methods("POST", "PATCH")
+	api.HandleFunc("/files/upload/resumable", handler.ResumableUploadInit).Methods("POST")
+
+	// Регистрируем обработчики для папок
+	api.HandleFunc("/folders", handler.CreateFolder).Methods("POST")
+	api.HandleFunc("/folders/{id}/contents", handler.ListFolderContents).Methods("GET")
+	api.HandleFunc("/folders/upload", handler.UploadFolder).Methods("POST")
+	api.HandleFunc("/folders/download", handler.DownloadFolder).Methods("GET")
+
 	// Регистрируем обработчики для файлов
-	api.HandleFunc("/files", handler.ListFiles).Methods("GET")
+	api.HandleFunc("/files/{id}/download", handler.DownloadFileByID).Methods("GET")
 	api.HandleFunc("/files/{id}", handler.GetFile).Methods("GET")
 	api.HandleFunc("/files/{id}", handler.DeleteFile).Methods("DELETE")
-	api.HandleFunc("/files/{id}/download", handler.DownloadFileByID).Methods("GET")
+	api.HandleFunc("/files/upload", handler.UploadFile).Methods("POST")  // Для совместимости с тестами
+	api.HandleFunc("/files", handler.ListFiles).Methods("GET")
+	api.HandleFunc("/files", handler.CreateFile).Methods("POST")
+	api.HandleFunc("/files", handler.UploadFile).Methods("PUT")  // Для совместимости с PUT запросами
 
 	// --- CORS middleware ---
 	corsMiddleware := handlers.CORS(
 		handlers.AllowedOrigins([]string{"*"}),
 		handlers.AllowedMethods([]string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}),
-		handlers.AllowedHeaders([]string{"Content-Type", "Authorization"}),
+		handlers.AllowedHeaders([]string{"Content-Type", "Authorization", "Content-Range"}),
 	)
 	return corsMiddleware(router)
 }
@@ -178,6 +200,7 @@ func (h *Handler) findFolderByPath(ctx context.Context, userID uuid.UUID, folder
 	return currentParentID, nil
 }
 
+
 // findFileByPath находит файл по указанному пути
 func (h *Handler) findFileByPath(ctx context.Context, userID uuid.UUID, filePath string) (*models.File, error) {
 	lg := logger.GetLoggerFromCtxSafe(ctx)
@@ -218,6 +241,7 @@ func (h *Handler) findFileByPath(ctx context.Context, userID uuid.UUID, filePath
 	return nil, fmt.Errorf("file '%s' not found in path '%s'", fileName, filePath)
 }
 
+
 // Структуры для запросов
 type UploadRequest struct {
 	FilePath string `json:"filePath"`
@@ -234,8 +258,8 @@ type ListFolderRequest struct {
 }
 
 type ResumableUploadRequest struct {
-	FilePath string `json:"filePath"`
-	Size     uint64 `json:"size"`
+	FilePath string `json:"filePath" validate:"required"`
+	Size     uint64 `json:"size" validate:"required,gt=0"`
 	SHA256   string `json:"sha256"`
 }
 
@@ -652,7 +676,7 @@ func (h *Handler) UploadFile(w http.ResponseWriter, r *http.Request) {
 	// Определяем MIME тип
 	mimeType := header.Header.Get("Content-Type")
 	if mimeType == "" {
-		mimeType = "application/octet-stream"
+		mimeType = getMimeTypeByExtension(filePath)
 	}
 
 	// Создаем запрос на создание файла
@@ -677,10 +701,35 @@ func (h *Handler) UploadFile(w http.ResponseWriter, r *http.Request) {
 		createReq.ParentID = parentID
 	}
 
-	// Создаем файл в системе
+	// Создаем файл в системе через fileService
 	createdFile, err := h.fileService.CreateFile(r.Context(), createReq, userID)
 	if err != nil {
 		lg.Error(r.Context(), "Failed to create file", zap.Error(err))
+		
+		// Проверяем, является ли это ошибкой дублирования имени файла
+		if strings.Contains(err.Error(), "duplicate key value violates unique constraint") {
+			// Генерируем альтернативное имя
+			alternativeName := generateAlternativeName(createReq.Name)
+
+			errorResponse := map[string]interface{}{
+				"error": "File with this name already exists",
+				"details": map[string]interface{}{
+					"fileName":   createReq.Name,
+					"suggestion": alternativeName,
+					"message":    fmt.Sprintf("A file named '%s' already exists in this location. Try using '%s' instead.", createReq.Name, alternativeName),
+				},
+			}
+
+			if lg != nil {
+				lg.Info(r.Context(), "Duplicate file name detected",
+					zap.String("fileName", createReq.Name),
+					zap.String("suggestedName", alternativeName))
+			}
+
+			h.respondWithJSON(w, http.StatusConflict, errorResponse)
+			return
+		}
+
 		h.respondWithError(w, http.StatusInternalServerError, "Failed to create file")
 		return
 	}
@@ -694,64 +743,72 @@ func (h *Handler) UploadFile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) DownloadFile(w http.ResponseWriter, r *http.Request) {
-	lg := logger.GetLoggerFromCtxSafe(r.Context())
-	lg.Info(r.Context(), "DownloadFile handler called")
+    lg := logger.GetLoggerFromCtxSafe(r.Context())
+    lg.Info(r.Context(), "DownloadFile handler called")
 
-	// Получаем userID из контекста
-	userID, err := h.getUserIDFromRequest(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, "Unauthorized")
-		return
-	}
+    // Получаем userID из контекста
+    userID, err := h.getUserIDFromRequest(r)
+    if err != nil {
+        lg.Error(r.Context(), "Unauthorized access attempt", zap.Error(err))
+        h.respondWithError(w, http.StatusUnauthorized, "Unauthorized")
+        return
+    }
 
-	// Получаем путь к файлу из query параметров
-	filePath := r.URL.Query().Get("path")
-	if filePath == "" {
-		h.respondWithError(w, http.StatusBadRequest, "File path is required")
-		return
-	}
+    // Получаем и валидируем путь к файлу
+    filePath := r.URL.Query().Get("path")
+    if filePath == "" {
+        h.respondWithError(w, http.StatusBadRequest, "File path is required")
+        return
+    }
 
-	// Нормализуем путь
-	filePath = filepath.Clean(filePath)
-	if filepath.IsAbs(filePath) {
-		h.respondWithError(w, http.StatusBadRequest, "Absolute paths are not allowed")
-		return
-	}
+    // Нормализация и проверка пути
+    filePath = filepath.Clean(filePath)
+    if filepath.IsAbs(filePath) || strings.Contains(filePath, "..") {
+        lg.Info(r.Context(), "Invalid path attempt", zap.String("path", filePath))
+        h.respondWithError(w, http.StatusBadRequest, "Invalid file path")
+        return
+    }
 
-	// Проверяем, что путь не содержит запрещенные символы
-	if strings.Contains(filePath, "..") {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid file path")
-		return
-	}
+    // Находим файл по пути
+    file, err := h.findFileByPath(r.Context(), userID, filePath)
+    if err != nil {
+        lg.Error(r.Context(), "File not found", zap.Error(err), zap.String("path", filePath))
+        h.respondWithError(w, http.StatusNotFound, "File not found")
+        return
+    }
 
-	// Находим файл по пути
-	file, err := h.findFileByPath(r.Context(), userID, filePath)
-	if err != nil {
-		lg.Error(r.Context(), "Failed to find file by path", zap.Error(err), zap.String("path", filePath))
-		h.respondWithError(w, http.StatusNotFound, "File not found")
-		return
-	}
+    // Скачиваем файл по ID
+    reader, filename, err := h.fileService.DownloadFile(r.Context(), file.ID, userID)
+    if err != nil {
+        lg.Error(r.Context(), "File download failed", zap.Error(err), zap.String("fileID", file.ID.String()))
+        h.respondWithError(w, http.StatusInternalServerError, "Failed to download file")
+        return
+    }
+    defer func() {
+        if err := reader.Close(); err != nil {
+            lg.Error(r.Context(), "Failed to close file reader", zap.Error(err))
+        }
+    }()
 
-	// Скачиваем файл по ID
-	reader, filename, err := h.fileService.DownloadFile(r.Context(), file.ID, userID)
-	if err != nil {
-		lg.Error(r.Context(), "Failed to download file", zap.Error(err))
-		h.respondWithError(w, http.StatusInternalServerError, "Failed to download file")
-		return
-	}
-	defer reader.Close()
+    // Определяем MIME-тип
+    mimeType := "application/octet-stream"
+    if ext := filepath.Ext(filename); ext != "" {
+        mimeType = mime.TypeByExtension(ext)
+    }
 
-	// Устанавливаем заголовки для скачивания файла
-	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filename))
+    // Устанавливаем заголовки
+    w.Header().Set("Content-Type", mimeType)
+    w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filename))
+    w.Header().Set("Content-Length", fmt.Sprintf("%d", file.Size))
 
-	// Копируем содержимое файла в ответ
-	_, err = io.Copy(w, reader)
-	if err != nil {
-		lg.Error(r.Context(), "Failed to copy file content", zap.Error(err))
-		h.respondWithError(w, http.StatusInternalServerError, "Failed to copy file content")
-		return
-	}
+    // Копируем содержимое файла в ответ
+    if _, err = io.Copy(w, reader); err != nil {
+        lg.Error(r.Context(), "Failed to send file content", zap.Error(err))
+        // Не отправляем повторный ответ об ошибке, так как часть данных уже могла быть отправлена
+        return
+    }
+
+    lg.Info(r.Context(), "File downloaded successfully", zap.String("filename", filename))
 }
 
 // Обработчики загрузки и скачивания по ID файла
@@ -795,49 +852,147 @@ func (h *Handler) UploadFileByID(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) DownloadFileByID(w http.ResponseWriter, r *http.Request) {
-	lg := logger.GetLoggerFromCtxSafe(r.Context())
-	if lg != nil {
-		lg.Info(r.Context(), "DownloadFileByID handler called")
+    lg := logger.GetLoggerFromCtxSafe(r.Context())
+    
+    // Упрощенное логирование
+    log := func(msg string) {
+        if lg != nil {
+            lg.Info(r.Context(), "DownloadHandler: "+msg)
+        }
+    }
+    logError := func(err error, msg string) {
+        if lg != nil {
+            lg.Error(r.Context(), "DownloadHandler: "+msg, zap.Error(err))
+        }
+    }
+
+    log("Handler called")
+
+    // Получаем ID пользователя
+    userID, err := h.getUserIDFromRequest(r)
+    if err != nil {
+        logError(err, "Failed to get user ID")
+        h.respondWithError(w, http.StatusUnauthorized, "Unauthorized")
+        return
+    }
+    log(fmt.Sprintf("User ID: %s", userID))
+
+    // Получаем ID файла
+    fileID, err := h.parseUUIDParam(r, "id")
+    if err != nil {
+        logError(err, "Invalid file ID")
+        h.respondWithError(w, http.StatusBadRequest, "Invalid file ID")
+        return
+    }
+    log(fmt.Sprintf("File ID: %s", fileID))
+
+    // Получаем метаданные файла
+    file, err := h.fileService.GetFile(r.Context(), fileID, userID)
+    if err != nil || file == nil {
+        logError(err, "File not found")
+        h.respondWithError(w, http.StatusNotFound, "File not found")
+        return
+    }
+    
+    // Проверяем, что это не папка
+    if file.IsFolder {
+        log("Attempt to download folder")
+        h.respondWithError(w, http.StatusBadRequest, "Cannot download a folder")
+        return
+    }
+    log(fmt.Sprintf("File found: %s, Size: %d bytes", file.Name, file.Size))
+
+    // Получаем содержимое файла
+    reader, mimeType, err := h.fileService.DownloadFile(r.Context(), fileID, userID)
+    if err != nil {
+        logError(err, "Failed to get file content")
+        h.respondWithError(w, http.StatusInternalServerError, "Failed to download file")
+        return
+    }
+
+    // Устанавливаем заголовки
+    w.Header().Set("Content-Type", mimeType)
+    w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", file.Name))
+    w.Header().Set("Content-Length", fmt.Sprintf("%d", file.Size))
+
+    // Отправляем файл
+    startTime := time.Now()
+    bytesCopied, err := io.Copy(w, reader)
+    
+    // Закрываем reader ПОСЛЕ копирования
+    if closeErr := reader.Close(); closeErr != nil {
+        logError(closeErr, "Failed to close reader")
+    }
+    
+    duration := time.Since(startTime)
+    
+    // Логируем результат
+    if err != nil {
+        logError(err, fmt.Sprintf("Failed to send file. Sent: %d/%d bytes", bytesCopied, file.Size))
+    } else {
+        log(fmt.Sprintf("File sent successfully. Bytes: %d, Duration: %s", bytesCopied, duration))
+    }
+}
+
+type httpRange struct {
+	start, end int64
+}
+
+func parseRanges(rangeHeader string, fileSize int64) ([]httpRange, error) {
+	if !strings.HasPrefix(rangeHeader, "bytes=") {
+		return nil, fmt.Errorf("invalid range header format")
 	}
 
-	userID, err := h.getUserIDFromRequest(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, "Unauthorized")
-		return
-	}
-
-	fileID, err := h.parseUUIDParam(r, "id")
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid file ID")
-		return
-	}
-
-	file, err := h.fileService.GetFile(r.Context(), fileID, userID)
-	if err != nil || file == nil {
-		h.respondWithError(w, http.StatusNotFound, "File not found")
-		return
-	}
-	if file.IsFolder {
-		h.respondWithError(w, http.StatusBadRequest, "Cannot download a folder")
-		return
-	}
-
-	reader, mimeType, err := h.fileService.DownloadFile(r.Context(), fileID, userID)
-	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, "Failed to download file")
-		return
-	}
-	defer reader.Close()
-
-	w.Header().Set("Content-Type", mimeType)
-	w.Header().Set("Content-Disposition", "attachment; filename=\""+file.Name+"\"")
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", file.Size))
-
-	if _, err := io.Copy(w, reader); err != nil {
-		if lg != nil {
-			lg.Error(r.Context(), "Failed to send file", zap.Error(err))
+	var ranges []httpRange
+	for _, r := range strings.Split(rangeHeader[6:], ",") {
+		r = strings.TrimSpace(r)
+		if r == "" {
+			continue
 		}
+
+		parts := strings.Split(r, "-")
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("invalid range format")
+		}
+
+		var start, end int64
+		var err error
+
+		if parts[0] == "" {
+			// suffix length (e.g., -100)
+			end = fileSize - 1
+			start = fileSize - 1
+			if parts[1] != "" {
+				if start, err = strconv.ParseInt(parts[1], 10, 64); err != nil {
+					return nil, fmt.Errorf("invalid range start")
+				}
+				start = fileSize - start
+				if start < 0 {
+					start = 0
+				}
+			}
+		} else {
+			// normal range (e.g., 100-200)
+			if start, err = strconv.ParseInt(parts[0], 10, 64); err != nil {
+				return nil, fmt.Errorf("invalid range start")
+			}
+			if parts[1] == "" {
+				end = fileSize - 1
+			} else {
+				if end, err = strconv.ParseInt(parts[1], 10, 64); err != nil {
+					return nil, fmt.Errorf("invalid range end")
+				}
+			}
+		}
+
+		if start > end {
+			return nil, fmt.Errorf("invalid range: start > end")
+		}
+
+		ranges = append(ranges, httpRange{start: start, end: end})
 	}
+
+	return ranges, nil
 }
 
 func (h *Handler) GetFileContent(w http.ResponseWriter, r *http.Request) {
@@ -876,103 +1031,81 @@ func (h *Handler) GetFileContent(w http.ResponseWriter, r *http.Request) {
 
 // Возобновляемые операции
 func (h *Handler) ResumableUploadInit(w http.ResponseWriter, r *http.Request) {
-	// Получаем userID из контекста
+	ctx := r.Context()
+	lg := logger.GetLoggerFromCtxSafe(ctx)
+
+	// Получаем ID пользователя
 	userID, err := h.getUserIDFromRequest(r)
 	if err != nil {
+		if lg != nil {
+			lg.Error(ctx, "Failed to get user ID", zap.Error(err))
+		}
 		h.respondWithError(w, http.StatusUnauthorized, "Unauthorized")
 		return
 	}
 
-	// Декодируем JSON-запрос
+	// Декодируем запрос
 	var req ResumableUploadRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Unable to decode request")
-		return
-	}
-	defer r.Body.Close()
-
-	// Валидация
-	if req.FilePath == "" {
-		h.respondWithError(w, http.StatusBadRequest, "File path cannot be empty")
+		if lg != nil {
+			lg.Error(ctx, "Failed to decode request", zap.Error(err))
+		}
+		h.respondWithError(w, http.StatusBadRequest, "Invalid request format")
 		return
 	}
 
-	// Формируем путь с учетом пользователя
-	userFilePath := filepath.Join(userID.String(), req.FilePath)
+	// Валидируем запрос
+	if err := h.validator.Struct(req); err != nil {
+		if lg != nil {
+			lg.Error(ctx, "Invalid request", zap.Error(err))
+		}
+		h.respondWithError(w, http.StatusBadRequest, "FilePath and Size are required")
+		return
+	}
 
-	// Создаем уникальный sessionID
+	// Нормализуем путь
+	req.FilePath = filepath.Clean(req.FilePath)
+	if filepath.IsAbs(req.FilePath) {
+		h.respondWithError(w, http.StatusBadRequest, "Absolute paths are not allowed")
+		return
+	}
+
+	// Проверяем, что путь не содержит запрещенные символы
+	if strings.Contains(req.FilePath, "..") {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid file path")
+		return
+	}
+
+	// Если путь содержит папки, проверяем их существование или создаем
+	dirPath := filepath.Dir(req.FilePath)
+	var parentID *uuid.UUID
+	if dirPath != "." && dirPath != "/" {
+		var err error
+		parentID, err = h.ensureFolderPath(ctx, userID, dirPath)
+		if err != nil {
+			lg.Error(ctx, "Failed to ensure folder path", zap.Error(err))
+			h.respondWithError(w, http.StatusInternalServerError, "Failed to prepare upload location")
+			return
+		}
+	}
+
+	// Создаем сессию
 	sessionID := uuid.New().String()
-
-	// Сохраняем сессию в storage service
-	// TODO: Добавить метод для сохранения сессии в storage service
-	// h.storageService.saveUploadSession(sessionID, userFilePath, req.SHA256, int64(req.Size))
-	_ = userFilePath // Временно игнорируем для компиляции
-
-	// Формируем ответ
-	response := map[string]string{
-		"upload_url": fmt.Sprintf("/api/v1/upload/resumable/%s", sessionID),
-		"sessionID":  sessionID,
+	session := uploadSession{
+		FilePath:  req.FilePath,
+		Size:      req.Size,
+		SHA256:    req.SHA256,
+		UserID:    userID,
+		ParentID:  parentID,
 	}
 
-	h.respondWithJSON(w, http.StatusOK, response)
-}
+	// Сохраняем сессию
+	saveSession(sessionID, session)
 
-func (h *Handler) ResumableUpload(w http.ResponseWriter, r *http.Request) {
-	// Получаем sessionID из URL
-	vars := mux.Vars(r)
-	sessionID := vars["sessionID"]
-
-	// Получаем сессию
-	// TODO: Добавить метод для получения сессии из storage service
-	// session, err := h.storageService.getUploadSession(sessionID)
-	// if err != nil {
-	//     h.respondWithError(w, http.StatusNotFound, "Session not found")
-	//     return
-	// }
-
-	// Читаем заголовок Content-Range
-	rangeHeader := r.Header.Get("Content-Range")
-	if rangeHeader == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Content-Range header is required")
-		return
-	}
-
-	// Парсим диапазон
-	matches := rangeRegex.FindStringSubmatch(rangeHeader)
-	if len(matches) < 3 {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid Content-Range format")
-		return
-	}
-
-	start, err := strconv.ParseUint(matches[1], 10, 64)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid start value")
-		return
-	}
-
-	end, err := strconv.ParseUint(matches[2], 10, 64)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid end value")
-		return
-	}
-
-	// TODO: Реализовать сохранение части файла
-	// Читаем содержимое из тела запроса
-	content, err := io.ReadAll(r.Body)
-	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, "Failed to read request body")
-		return
-	}
-
-	// TODO: Сохранить часть файла в указанную позицию
-	// h.storageService.saveFileChunk(session.filePath, start, content)
-	_ = start
-	_ = end
-	_ = content
-	_ = sessionID
-
-	h.respondWithJSON(w, http.StatusOK, map[string]string{
-		"message": "Chunk uploaded successfully",
+	// Отправляем ответ
+	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
+		"session_id": sessionID,
+		"upload_url": fmt.Sprintf("/upload/resumable/%s", sessionID),
 	})
 }
 
@@ -2124,16 +2257,548 @@ func (h *Handler) GetFileDetails(w http.ResponseWriter, r *http.Request) {
 	h.respondWithJSON(w, http.StatusOK, file)
 }
 
-// generateAlternativeName генерирует альтернативное имя файла
-func generateAlternativeName(originalName string) string {
-	ext := filepath.Ext(originalName)
-	baseName := strings.TrimSuffix(originalName, ext)
+// generateAlternativeName генерирует альтернативное имя для файла, если файл с таким именем уже существует
+func generateAlternativeName(name string) string {
+	ext := filepath.Ext(name)
+	baseName := strings.TrimSuffix(name, ext)
+	timestamp := time.Now().UnixNano()
+	return fmt.Sprintf("%s_%d%s", baseName, timestamp, ext)
+}
 
-	// Добавляем временную метку
-	timestamp := time.Now().Format("20060102_150405")
+func (h *Handler) ResumableUpload(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	lg := logger.GetLoggerFromCtxSafe(ctx)
 
-	if ext != "" {
-		return fmt.Sprintf("%s_%s%s", baseName, timestamp, ext)
+	// Получаем sessionID из URL
+	vars := mux.Vars(r)
+	sessionID := vars["sessionID"]
+	if sessionID == "" {
+		h.respondWithError(w, http.StatusBadRequest, "Session ID is required")
+		return
 	}
-	return fmt.Sprintf("%s_%s", baseName, timestamp)
+
+	// Получаем сессию
+	session, err := getSession(sessionID)
+	if err != nil {
+		if lg != nil {
+			lg.Error(ctx, "Session not found", zap.Error(err), zap.String("sessionID", sessionID))
+		}
+		h.respondWithError(w, http.StatusNotFound, "Upload session not found")
+		return
+	}
+
+	// Проверяем пользователя
+	userID, err := h.getUserIDFromRequest(r)
+	if err != nil || userID != session.UserID {
+		if lg != nil {
+			lg.Error(ctx, "Unauthorized upload attempt", zap.Error(err))
+		}
+		h.respondWithError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	// Проверяем заголовок Content-Range
+	rangeHeader := r.Header.Get("Content-Range")
+	if rangeHeader == "" {
+		h.respondWithError(w, http.StatusBadRequest, "Content-Range header is required")
+		return
+	}
+
+	start, end, err := parseContentRange(rangeHeader)
+	total := end
+	if err != nil {
+		if lg != nil {
+			lg.Error(ctx, "Invalid Content-Range", zap.Error(err), zap.String("range", rangeHeader))
+		}
+		h.respondWithError(w, http.StatusBadRequest, "Invalid Content-Range header")
+		return
+	}
+
+	// Проверяем, что размер файла совпадает с размером в сессии
+	if total != session.Size {
+		if lg != nil {
+			lg.Error(ctx, "File size mismatch",
+				zap.Int("expected", int(session.Size)),
+				zap.Int("actual", int(total)))
+		}
+		h.respondWithError(w, http.StatusBadRequest, "File size mismatch")
+		return
+	}
+
+	// Создаем временный файл для загрузки
+	tempDir := filepath.Join(os.TempDir(), "resumable_uploads")
+	if err := os.MkdirAll(tempDir, 0755); err != nil {
+		if lg != nil {
+			lg.Error(ctx, "Failed to create temp directory", zap.Error(err))
+		}
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to prepare upload location")
+		return
+	}
+
+	tempFilePath := filepath.Join(tempDir, sessionID)
+	file, err := os.OpenFile(tempFilePath, os.O_WRONLY|os.O_CREATE, 0666)
+	if err != nil {
+		if lg != nil {
+			lg.Error(ctx, "Failed to open temp file", zap.Error(err))
+		}
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to process upload")
+		return
+	}
+	defer file.Close()
+
+	// Записываем данные в нужную позицию
+	if _, err := file.Seek(int64(start), 0); err != nil {
+		if lg != nil {
+			lg.Error(ctx, "Failed to seek in file", zap.Error(err))
+		}
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to process upload")
+		return
+	}
+
+	if _, err := io.Copy(file, r.Body); err != nil {
+		if lg != nil {
+			lg.Error(ctx, "Failed to write chunk", zap.Error(err))
+		}
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to process upload")
+		return
+	}
+
+	// Проверяем, завершена ли загрузка
+	isComplete := end+1 == session.Size
+
+	// Синхронизируем файл
+	if err := file.Sync(); err != nil {
+		if lg != nil {
+			lg.Error(ctx, "Failed to sync file", zap.Error(err))
+		}
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to finalize upload")
+		return
+	}
+
+	if isComplete {
+		// Проверяем контрольную сумму, если она была предоставлена
+		if session.SHA256 != "" {
+			if err := file.Sync(); err != nil {
+				if lg != nil {
+					lg.Error(ctx, "Failed to sync file", zap.Error(err))
+				}
+				h.respondWithError(w, http.StatusInternalServerError, "Failed to finalize upload")
+				return
+			}
+
+			hasher := sha256.New()
+			if _, err := file.Seek(0, 0); err != nil {
+				if lg != nil {
+					lg.Error(ctx, "Failed to seek to start", zap.Error(err))
+				}
+				h.respondWithError(w, http.StatusInternalServerError, "Failed to verify upload")
+				return
+			}
+
+			if _, err := io.Copy(hasher, file); err != nil {
+				if lg != nil {
+					lg.Error(ctx, "Failed to calculate checksum", zap.Error(err))
+				}
+				h.respondWithError(w, http.StatusInternalServerError, "Failed to verify upload")
+				return
+			}
+
+			actualSHA256 := fmt.Sprintf("%x", hasher.Sum(nil))
+			if actualSHA256 != session.SHA256 {
+				if lg != nil {
+					lg.Error(ctx, "Checksum mismatch",
+						zap.String("expected", session.SHA256),
+						zap.String("actual", actualSHA256))
+				}
+				os.Remove(tempFilePath)
+				h.respondWithError(w, http.StatusBadRequest, "Checksum verification failed")
+				return
+			}
+		}
+
+		// Читаем содержимое файла
+		if _, err := file.Seek(0, 0); err != nil {
+			if lg != nil {
+				lg.Error(ctx, "Failed to seek to start", zap.Error(err))
+			}
+			h.respondWithError(w, http.StatusInternalServerError, "Failed to prepare file content")
+			return
+		}
+
+		content, err := io.ReadAll(file)
+		if err != nil {
+			if lg != nil {
+				lg.Error(ctx, "Failed to read file content", zap.Error(err))
+			}
+			h.respondWithError(w, http.StatusInternalServerError, "Failed to prepare file content")
+			return
+		}
+
+		// Определяем MIME тип
+		mimeType := getMimeTypeByExtension(session.FilePath)
+
+		// Создаем запрос на создание файла
+		createReq := &models.CreateFileRequest{
+			Name:     filepath.Base(session.FilePath),
+			MimeType: mimeType,
+			Size:     int64(session.Size),
+			Content:  content,
+			IsFolder: false,
+			ParentID: session.ParentID,
+		}
+
+		// Создаем файл в системе через fileService
+		createdFile, err := h.fileService.CreateFile(ctx, createReq, session.UserID)
+		if err != nil {
+			if lg != nil {
+				lg.Error(ctx, "Failed to create file", zap.Error(err))
+			}
+
+			// Проверяем, является ли это ошибкой дублирования имени файла
+			if strings.Contains(err.Error(), "duplicate key value violates unique constraint") {
+				// Генерируем альтернативное имя
+				alternativeName := generateAlternativeName(createReq.Name)
+
+				errorResponse := map[string]interface{}{
+					"error": "File with this name already exists",
+					"details": map[string]interface{}{
+						"fileName":   createReq.Name,
+						"suggestion": alternativeName,
+						"message":    fmt.Sprintf("A file named '%s' already exists in this location. Try using '%s' instead.", createReq.Name, alternativeName),
+					},
+				}
+
+				if lg != nil {
+					lg.Info(ctx, "Duplicate file name detected",
+						zap.String("fileName", createReq.Name),
+						zap.String("suggestedName", alternativeName))
+				}
+
+				h.respondWithJSON(w, http.StatusConflict, errorResponse)
+				return
+			}
+
+			h.respondWithError(w, http.StatusInternalServerError, "Failed to create file")
+			return
+		}
+
+		// Удаляем временный файл и сессию
+		os.Remove(tempFilePath)
+		deleteSession(sessionID)
+
+		h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+			"message": "Upload completed successfully",
+			"file":    createdFile,
+		})
+	} else {
+		// Загрузка не завершена, отправляем статус успешной обработки части
+		h.respondWithJSON(w, http.StatusAccepted, map[string]interface{}{
+			"message": "Chunk uploaded successfully",
+			"range":   rangeHeader,
+		})
+	}
+}
+
+var (
+	sessions = make(map[string]uploadSession)
+)
+
+
+// MIME типы по расширениям
+var mimeTypes = map[string]string{
+	// Текстовые файлы
+	".txt":  "text/plain",
+	".md":   "text/markdown",
+	".html": "text/html",
+	".css":  "text/css",
+	".js":   "application/javascript",
+	".json": "application/json",
+	".xml":  "application/xml",
+	".csv":  "text/csv",
+	".log":  "text/plain",
+
+	// Изображения
+	".jpg":  "image/jpeg",
+	".jpeg": "image/jpeg",
+	".png":  "image/png",
+	".gif":  "image/gif",
+	".bmp":  "image/bmp",
+	".svg":  "image/svg+xml",
+	".webp": "image/webp",
+	".ico":  "image/x-icon",
+
+	// Документы
+	".pdf":  "application/pdf",
+	".doc":  "application/msword",
+	".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+	".xls":  "application/vnd.ms-excel",
+	".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+	".ppt":  "application/vnd.ms-powerpoint",
+	".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+
+	// Архивы
+	".zip": "application/zip",
+	".rar": "application/vnd.rar",
+	".7z":  "application/x-7z-compressed",
+	".tar": "application/x-tar",
+	".gz":  "application/gzip",
+
+	// Аудио
+	".mp3":  "audio/mpeg",
+	".wav":  "audio/wav",
+	".ogg":  "audio/ogg",
+	".flac": "audio/flac",
+	".aac":  "audio/aac",
+
+	// Видео
+	".mp4":  "video/mp4",
+	".avi":  "video/x-msvideo",
+	".mkv":  "video/x-matroska",
+	".mov":  "video/quicktime",
+	".wmv":  "video/x-ms-wmv",
+	".flv":  "video/x-flv",
+	".webm": "video/webm",
+
+	// Код
+	".py":   "text/x-python",
+	".java": "text/x-java-source",
+	".cpp":  "text/x-c++src",
+	".c":    "text/x-csrc",
+	".go":   "text/x-go",
+	".php":  "text/x-php",
+	".rb":   "text/x-ruby",
+	".sh":   "application/x-sh",
+	".bat":  "application/x-msdos-program",
+
+	// Другие
+	".sql":  "application/sql",
+	".yaml": "application/x-yaml",
+	".yml":  "application/x-yaml",
+	".toml": "application/toml",
+	".ini":  "text/plain",
+	".conf": "text/plain",
+	".cfg":  "text/plain",
+}
+
+// getMimeTypeByExtension определяет MIME тип по расширению файла
+func getMimeTypeByExtension(filename string) string {
+	ext := strings.ToLower(filepath.Ext(filename))
+	if mimeType, exists := mimeTypes[ext]; exists {
+		return mimeType
+	}
+	return "application/octet-stream"
+}
+
+// UploadFolder обрабатывает загрузку папки в виде ZIP архива
+func (h *Handler) UploadFolder(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	lg := logger.GetLoggerFromCtxSafe(ctx)
+
+	// Получаем userID из контекста
+	userID, err := h.getUserIDFromRequest(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	// Парсим multipart/form-data
+	err = r.ParseMultipartForm(32 << 20) // 32MB max
+	if err != nil {
+		lg.Error(ctx, "Failed to parse multipart form", zap.Error(err))
+		h.respondWithError(w, http.StatusBadRequest, "Failed to parse form data")
+		return
+	}
+	defer r.MultipartForm.RemoveAll()
+
+	// Получаем ZIP файл из формы
+	file, header, err := r.FormFile("folder")
+	if err != nil {
+		lg.Error(ctx, "Failed to get folder from form", zap.Error(err))
+		h.respondWithError(w, http.StatusBadRequest, "No folder provided")
+		return
+	}
+	defer file.Close()
+
+	// Получаем путь к папке из формы
+	folderPath := r.FormValue("folderPath")
+	if folderPath == "" {
+		// Если путь не указан, используем имя файла без расширения
+		folderPath = strings.TrimSuffix(header.Filename, filepath.Ext(header.Filename))
+	}
+
+	// Валидация пути папки
+	if folderPath == "" {
+		h.respondWithError(w, http.StatusBadRequest, "Folder path cannot be empty")
+		return
+	}
+
+	// Нормализуем путь
+	folderPath = filepath.Clean(folderPath)
+	if filepath.IsAbs(folderPath) {
+		h.respondWithError(w, http.StatusBadRequest, "Absolute paths are not allowed")
+		return
+	}
+
+	// Проверяем, что путь не содержит запрещенные символы
+	if strings.Contains(folderPath, "..") {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid folder path")
+		return
+	}
+
+	// Создаем корневую папку
+	rootFolder, err := h.fileService.CreateFolder(ctx, filepath.Base(folderPath), nil, userID)
+	if err != nil {
+		lg.Error(ctx, "Failed to create root folder", zap.Error(err))
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to create folder structure")
+		return
+	}
+
+	// Читаем ZIP архив
+	zipReader, err := zip.NewReader(file, header.Size)
+	if err != nil {
+		lg.Error(ctx, "Failed to read ZIP archive", zap.Error(err))
+		h.respondWithError(w, http.StatusBadRequest, "Invalid ZIP archive")
+		return
+	}
+
+	// Создаем структуру папок и файлов
+	for _, zipFile := range zipReader.File {
+		// Пропускаем директории, они будут созданы автоматически
+		if zipFile.FileInfo().IsDir() {
+			continue
+		}
+
+		// Получаем содержимое файла
+		rc, err := zipFile.Open()
+		if err != nil {
+			lg.Error(ctx, "Failed to open file in ZIP", zap.Error(err), zap.String("file", zipFile.Name))
+			continue
+		}
+
+		content, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil {
+			lg.Error(ctx, "Failed to read file content", zap.Error(err), zap.String("file", zipFile.Name))
+			continue
+		}
+
+		// Определяем путь к файлу относительно корневой папки
+		relPath := filepath.Join(folderPath, zipFile.Name)
+		dirPath := filepath.Dir(relPath)
+
+		// Создаем структуру папок
+		var parentID *uuid.UUID
+		if dirPath != "." && dirPath != "/" {
+			parentID, err = h.ensureFolderPath(ctx, userID, dirPath)
+			if err != nil {
+				lg.Error(ctx, "Failed to create folder path", zap.Error(err), zap.String("path", dirPath))
+				continue
+			}
+		} else {
+			parentID = &rootFolder.ID
+		}
+
+		// Создаем файл
+		createReq := &models.CreateFileRequest{
+			Name:     filepath.Base(zipFile.Name),
+			MimeType: getMimeTypeByExtension(zipFile.Name),
+			Size:     int64(len(content)),
+			Content:  content,
+			IsFolder: false,
+			ParentID: parentID,
+		}
+
+		_, err = h.fileService.CreateFile(ctx, createReq, userID)
+		if err != nil {
+			lg.Error(ctx, "Failed to create file", zap.Error(err), zap.String("file", zipFile.Name))
+			continue
+		}
+	}
+
+	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
+		"message": "Folder uploaded successfully",
+		"folder":  rootFolder,
+	})
+}
+
+// DownloadFolder обрабатывает скачивание папки в виде ZIP архива
+func (h *Handler) DownloadFolder(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	lg := logger.GetLoggerFromCtxSafe(ctx)
+
+	// Получаем userID из контекста
+	userID, err := h.getUserIDFromRequest(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	// Получаем путь к папке
+	folderPath := r.URL.Query().Get("path")
+	if folderPath == "" {
+		h.respondWithError(w, http.StatusBadRequest, "Folder path is required")
+		return
+	}
+
+	// Нормализация и проверка пути
+	folderPath = filepath.Clean(folderPath)
+	if filepath.IsAbs(folderPath) || strings.Contains(folderPath, "..") {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid folder path")
+		return
+	}
+
+	// Находим папку по пути
+	folder, err := h.findFileByPath(ctx, userID, folderPath)
+	if err != nil {
+		lg.Error(ctx, "Folder not found", zap.Error(err))
+		h.respondWithError(w, http.StatusNotFound, "Folder not found")
+		return
+	}
+
+	if !folder.IsFolder {
+		h.respondWithError(w, http.StatusBadRequest, "Specified path is not a folder")
+		return
+	}
+
+	// Получаем список всех файлов в папке
+	files, err := h.fileService.ListFolderContents(ctx, &folder.ID, userID)
+	if err != nil {
+		lg.Error(ctx, "Failed to list folder contents", zap.Error(err))
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to prepare folder contents")
+		return
+	}
+
+	// Создаем ZIP архив
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s.zip\"", folder.Name))
+
+	zipWriter := zip.NewWriter(w)
+	defer zipWriter.Close()
+
+	// Добавляем файлы в архив
+	for _, file := range files {
+		if file.IsFolder {
+			continue
+		}
+
+		// Создаем файл в архиве
+		writer, err := zipWriter.Create(file.Name)
+		if err != nil {
+			lg.Error(ctx, "Failed to create file in ZIP", zap.Error(err))
+			continue
+		}
+
+		// Получаем содержимое файла
+		content, err := h.fileService.GetFileContent(ctx, file.ID, userID)
+		if err != nil {
+			lg.Error(ctx, "Failed to get file content", zap.Error(err))
+			continue
+		}
+
+		// Записываем содержимое в архив
+		if _, err := writer.Write(content); err != nil {
+			lg.Error(ctx, "Failed to write file content to ZIP", zap.Error(err))
+			continue
+		}
+	}
 }
